@@ -12,15 +12,17 @@ import socket
 import time
 import xml.etree.ElementTree as ET
 import zlib
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import (
+  TYPE_CHECKING,
   Any,
   AsyncIterator,
   Awaitable,
   Callable,
   Dict,
-  TYPE_CHECKING,
   Iterable,
+  Literal,
   Optional,
   Sequence,
   Tuple,
@@ -59,12 +61,40 @@ DEFAULT_TRANSFER_TIMEOUT = 300.0
 DEFAULT_ECHO_CONFIGURATION_QUERY = (
   '<?xml version="1.0" encoding="utf-8"?><Configuration internal="true"></Configuration>'
 )
-# Default droplet/transfer volume granularity for the Echo 650 (nL). The Echo 525 dispenses
-# in coarser 25 nL increments instead; rather than fork this module, the 525 backend in
-# ``echo525.py`` reuses ``EchoDriver``/``Echo`` and overrides this via the
-# ``transfer_volume_increment_nl`` constructor argument (threaded through
-# ``build_echo_transfer_plan`` -> ``_validate_transfer_volume_nl``). See ``Echo525``.
+# Default droplet/transfer volume granularity for the Echo 650 (nL). Used as the fallback when a
+# model is not specified; per-model values live in ``ECHO_MODELS`` below.
 ECHO_TRANSFER_VOLUME_INCREMENT_NL = 2.5
+
+
+@dataclass(frozen=True)
+class EchoModel:
+  """Per-model defaults that distinguish Echo variants on an otherwise identical protocol.
+
+  The Echo 525 and 650 speak the same Medman protocol; they differ only in droplet granularity
+  (25 nL vs 2.5 nL) and the protocol/client version strings their firmware advertises.
+  """
+
+  name: str
+  transfer_volume_increment_nl: float
+  client_version: str
+  protocol_version: str
+
+
+ECHO_MODELS: Dict[str, EchoModel] = {
+  "Echo 650": EchoModel("Echo 650", 2.5, "3.1.0", "3.1"),
+  "Echo 525": EchoModel("Echo 525", 25.0, "2.7.3", "2.6"),
+}
+EchoModelName = Literal["Echo 650", "Echo 525"]
+DEFAULT_ECHO_MODEL: EchoModelName = "Echo 650"
+
+
+def _resolve_echo_model(model: str) -> EchoModel:
+  try:
+    return ECHO_MODELS[model]
+  except KeyError:
+    known = ", ".join(sorted(ECHO_MODELS))
+    raise ValueError(f"Unknown Echo model {model!r}. Known models: {known}.") from None
+
 
 OperatorPause = Callable[[str], Union[None, Awaitable[None]]]
 
@@ -1764,8 +1794,14 @@ class EchoEventStream:
     await self._writer.wait_closed()
 
 
-class EchoDriver(Driver):
-  """Driver for Labcyte Echo Medman access-control RPCs."""
+class EchoDriver(Driver, ABC):
+  """Abstract base for Echo drivers.
+
+  Holds all of the Echo Medman protocol logic (RPC serialization, survey/transfer parsing, lock
+  and session handling). Concrete subclasses implement only the transport: :class:`MedmanEchoDriver`
+  speaks SOAP-over-HTTP to a real instrument; :class:`EchoChatterboxDriver` logs and returns
+  ``SUCCEEDED`` without any I/O. This is the type to depend on and to inject into :class:`Echo`.
+  """
 
   def __init__(
     self,
@@ -1778,9 +1814,7 @@ class EchoDriver(Driver):
     token: Optional[str] = None,
     token_slot_a: int = DEFAULT_SLOT_A,
     token_slot_b: int = DEFAULT_SLOT_B,
-    client_version: str = "3.1.0",
-    protocol_version: str = "3.1",
-    transfer_volume_increment_nl: float = ECHO_TRANSFER_VOLUME_INCREMENT_NL,
+    model: EchoModelName = DEFAULT_ECHO_MODEL,
   ):
     super().__init__()
     self.host = host
@@ -1792,11 +1826,26 @@ class EchoDriver(Driver):
     self._token = token
     self.token_slot_a = token_slot_a
     self.token_slot_b = token_slot_b
-    self.client_version = client_version
-    self.protocol_version = protocol_version
-    self.transfer_volume_increment_nl = transfer_volume_increment_nl
+    #: The model's defaults. Version strings and the volume increment are exposed as properties.
+    self.spec = _resolve_echo_model(model)
     self._rpc_lock = asyncio.Lock()
     self._lock_held = False
+
+  @property
+  def model(self) -> str:
+    return self.spec.name
+
+  @property
+  def transfer_volume_increment_nl(self) -> float:
+    return self.spec.transfer_volume_increment_nl
+
+  @property
+  def client_version(self) -> str:
+    return self.spec.client_version
+
+  @property
+  def protocol_version(self) -> str:
+    return self.spec.protocol_version
 
   @property
   def token(self) -> str:
@@ -1840,20 +1889,9 @@ class EchoDriver(Driver):
       except Exception as exc:  # pragma: no cover - best-effort cleanup
         logger.warning("Failed to unlock Echo during stop: %s", exc)
 
+  @abstractmethod
   async def open_event_stream(self, timeout: Optional[float] = None) -> EchoEventStream:
-    request_timeout = _resolve_timeout(timeout, self.timeout)
-    reader, writer = await asyncio.wait_for(
-      asyncio.open_connection(self.host, self.event_port),
-      timeout=request_timeout,
-    )
-    try:
-      writer.write(self._make_event_registration_request())
-      await asyncio.wait_for(writer.drain(), timeout=request_timeout)
-    except Exception:
-      writer.close()
-      await writer.wait_closed()
-      raise
-    return EchoEventStream(self, reader, writer)
+    """Open the instrument event stream. Implemented by transport-specific subclasses."""
 
   def serialize(self) -> dict:
     return {
@@ -1867,9 +1905,7 @@ class EchoDriver(Driver):
       "token": self._token,
       "token_slot_a": self.token_slot_a,
       "token_slot_b": self.token_slot_b,
-      "client_version": self.client_version,
-      "protocol_version": self.protocol_version,
-      "transfer_volume_increment_nl": self.transfer_volume_increment_nl,
+      "model": self.model,
     }
 
   async def read_events(
@@ -3125,6 +3161,7 @@ class EchoDriver(Driver):
     )
     return self._parse_rpc_result(method, message)
 
+  @abstractmethod
   async def _send_request(
     self,
     port: int,
@@ -3132,44 +3169,7 @@ class EchoDriver(Driver):
     body_text: str,
     timeout: Optional[float] = None,
   ) -> _HttpMessage:
-    request_timeout = _resolve_timeout(timeout, self.timeout)
-    body_bytes = gzip.compress(body_text.encode("utf-8"))
-    request = (
-      "POST /Medman HTTP/1.1\n"
-      f"Host: {host_header}\n"
-      f"Client: {self.client_version}\n"
-      f"Protocol: {self.protocol_version}\n"
-      'Content-Type: text/xml; charset="utf-8"\n'
-      f"Content-Length: {len(body_bytes)}\n"
-      'SOAPAction: "Some-URI"\r\n'
-      "\r\n"
-    ).encode("ascii") + body_bytes
-
-    async with self._rpc_lock:
-      reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(self.host, port),
-        timeout=request_timeout,
-      )
-      try:
-        writer.write(request)
-        await asyncio.wait_for(writer.drain(), timeout=request_timeout)
-        return await self._read_http_message(reader, timeout=request_timeout)
-      finally:
-        writer.close()
-        await writer.wait_closed()
-
-  def _make_event_registration_request(self) -> bytes:
-    body_bytes = gzip.compress(f"add{self.token}".encode("utf-8"))
-    return (
-      "POST /Medman HTTP/1.1\n"
-      f"Host: {self.token}\n"
-      f"Client: {self.client_version}\n"
-      f"Protocol: {self.protocol_version}\n"
-      'Content-Type: text/xml; charset="utf-8"\n'
-      f"Content-Length: {len(body_bytes)}\n"
-      'SOAPAction: "Some-URI"\r\n'
-      "\r\n"
-    ).encode("ascii") + body_bytes
+    """Send one Medman request and return the parsed HTTP response. Transport-specific."""
 
   async def _read_http_message(
     self,
@@ -3383,6 +3383,114 @@ class EchoDriver(Driver):
     )
 
 
+class MedmanEchoDriver(EchoDriver):
+  """Concrete Echo driver speaking the Medman SOAP-over-HTTP protocol to a real instrument."""
+
+  async def open_event_stream(self, timeout: Optional[float] = None) -> EchoEventStream:
+    request_timeout = _resolve_timeout(timeout, self.timeout)
+    reader, writer = await asyncio.wait_for(
+      asyncio.open_connection(self.host, self.event_port),
+      timeout=request_timeout,
+    )
+    try:
+      writer.write(self._make_event_registration_request())
+      await asyncio.wait_for(writer.drain(), timeout=request_timeout)
+    except Exception:
+      writer.close()
+      await writer.wait_closed()
+      raise
+    return EchoEventStream(self, reader, writer)
+
+  def _make_event_registration_request(self) -> bytes:
+    body_bytes = gzip.compress(f"add{self.token}".encode("utf-8"))
+    return (
+      "POST /Medman HTTP/1.1\n"
+      f"Host: {self.token}\n"
+      f"Client: {self.client_version}\n"
+      f"Protocol: {self.protocol_version}\n"
+      'Content-Type: text/xml; charset="utf-8"\n'
+      f"Content-Length: {len(body_bytes)}\n"
+      'SOAPAction: "Some-URI"\r\n'
+      "\r\n"
+    ).encode("ascii") + body_bytes
+
+  async def _send_request(
+    self,
+    port: int,
+    host_header: str,
+    body_text: str,
+    timeout: Optional[float] = None,
+  ) -> _HttpMessage:
+    request_timeout = _resolve_timeout(timeout, self.timeout)
+    body_bytes = gzip.compress(body_text.encode("utf-8"))
+    request = (
+      "POST /Medman HTTP/1.1\n"
+      f"Host: {host_header}\n"
+      f"Client: {self.client_version}\n"
+      f"Protocol: {self.protocol_version}\n"
+      'Content-Type: text/xml; charset="utf-8"\n'
+      f"Content-Length: {len(body_bytes)}\n"
+      'SOAPAction: "Some-URI"\r\n'
+      "\r\n"
+    ).encode("ascii") + body_bytes
+
+    async with self._rpc_lock:
+      reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(self.host, port),
+        timeout=request_timeout,
+      )
+      try:
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=request_timeout)
+        return await self._read_http_message(reader, timeout=request_timeout)
+      finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+class EchoChatterboxDriver(EchoDriver):
+  """Hardware-free Echo driver: logs each RPC and replies ``SUCCEEDED``/``OK`` with no I/O.
+
+  Useful for dry-running command sequences (e.g. verifying a picklist's ``DoWellTransfer`` order)
+  without an instrument. RPCs that return data (instrument info, survey values) come back empty, so
+  this is for exercising control flow, not for realistic readings — use ``EchoMockServer`` for that.
+  """
+
+  def __init__(self, host: str = "chatterbox", **kwargs: Any):
+    super().__init__(host=host, **kwargs)
+    if self._token is None:
+      self._token = self.build_token(
+        self.host, slot_a=self.token_slot_a, slot_b=self.token_slot_b, epoch=0, pid=0
+      )
+
+  async def open_event_stream(self, timeout: Optional[float] = None) -> EchoEventStream:
+    raise NotImplementedError("EchoChatterboxDriver does not support event streams.")
+
+  async def _send_request(
+    self,
+    port: int,
+    host_header: str,
+    body_text: str,
+    timeout: Optional[float] = None,
+  ) -> _HttpMessage:
+    match = re.search(r"<SOAP-ENV:Body[^>]*><([A-Za-z][A-Za-z0-9_]*)", body_text)
+    method = match.group(1) if match else "Unknown"
+    logger.info("EchoChatterboxDriver: %s", method)
+    envelope = (
+      '<?xml version="1.0" encoding="UTF-8" standalone="no"?>'
+      '<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">'
+      f"<SOAP-ENV:Body><{method}Response><{method}>"
+      '<SUCCEEDED type="xsd:boolean">True</SUCCEEDED>'
+      '<Status type="xsd:string">OK</Status>'
+      f"</{method}></{method}Response></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+    )
+    return _HttpMessage(
+      start_line="HTTP/1.1 200 OK",
+      headers={"content-type": 'text/xml; charset="utf-8"'},
+      body=gzip.compress(envelope.encode("utf-8")),
+    )
+
+
 class EchoPlateAccessBackend(PlateAccessBackend):
   """Plate-access backend backed by the Echo Medman protocol."""
 
@@ -3501,18 +3609,20 @@ class EchoPlatePosition(ResourceHolder):
 
 
 class Echo(Device):
-  """Labcyte Echo access-control device frontend."""
+  """Labcyte Echo access-control device frontend.
 
-  #: Driver class used to talk to the instrument. Subclasses (e.g. the Echo 525) override
-  #: this to supply model-specific defaults such as the transfer volume increment.
-  driver_class: type[EchoDriver] = EchoDriver
-
-  #: Human-readable model name used for the deck resource.
-  model_name: str = "Labcyte Echo"
+  A single frontend serves every Echo variant. Select the model with ``model=`` (which picks the
+  matching :class:`EchoDriver` defaults, e.g. ``"Echo 525"`` for the 25 nL increment), or inject a
+  fully-configured driver with ``driver=`` (e.g. a chatterbox or vendor-SDK-backed driver). Exactly
+  one of ``host`` or ``driver`` is required.
+  """
 
   def __init__(
     self,
-    host: str,
+    host: Optional[str] = None,
+    *,
+    model: EchoModelName = DEFAULT_ECHO_MODEL,
+    driver: Optional[EchoDriver] = None,
     rpc_port: int = DEFAULT_RPC_PORT,
     event_port: int = DEFAULT_EVENT_PORT,
     timeout: float = DEFAULT_TIMEOUT,
@@ -3521,16 +3631,20 @@ class Echo(Device):
     token: Optional[str] = None,
     **driver_kwargs: Any,
   ):
-    driver = self.driver_class(
-      host=host,
-      rpc_port=rpc_port,
-      event_port=event_port,
-      timeout=timeout,
-      app_name=app_name,
-      owner=owner,
-      token=token,
-      **driver_kwargs,
-    )
+    if driver is None:
+      if host is None:
+        raise ValueError("Echo requires either host= (to build a driver) or driver=.")
+      driver = MedmanEchoDriver(
+        host=host,
+        model=model,
+        rpc_port=rpc_port,
+        event_port=event_port,
+        timeout=timeout,
+        app_name=app_name,
+        owner=owner,
+        token=token,
+        **driver_kwargs,
+      )
     super().__init__(driver=driver)
     self.driver: EchoDriver = driver
     self.plate_access = PlateAccess(backend=EchoPlateAccessBackend(driver))
@@ -3541,7 +3655,7 @@ class Echo(Device):
       size_y=300.0,
       size_z=260.0,
       category="labcyte_echo",
-      model=self.model_name,
+      model=getattr(driver, "model", model),
     )
     self.source_position = EchoPlatePosition(name="echo_source_position", role="source")
     self.destination_position = EchoPlatePosition(

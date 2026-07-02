@@ -7,7 +7,7 @@ planning, and raw Echo protocol execution through `DoWellTransfer`.
 ```{note}
 Using an **Echo 525**? It speaks the same Medman protocol as the 650 and reuses everything on this
 page. The only behavioural difference is its coarser 25 nL transfer increment. See
-[Echo 525](echo-525) for the `Echo525` frontend and the hardware-free mock server.
+[Echo 525](echo-525) for the `model="Echo 525"` selector and the hardware-free mock server.
 ```
 
 Supported operations:
@@ -90,8 +90,11 @@ The integration follows the PLR device/driver/capability split:
 
 - `Echo` is the user-facing device frontend. It exposes Echo operations, owns the source and
   destination PLR plate holders, and delegates instrument I/O to its driver.
-- `EchoDriver` owns the Medman protocol details: SOAP envelope construction, gzip framing,
-  lock tokens, polling, event streams, survey parsing, and transfer report parsing.
+- `EchoDriver` is the abstract base holding the Medman protocol logic (SOAP envelope construction,
+  gzip framing, lock tokens, polling, survey/transfer parsing). Concrete subclasses implement only
+  the transport: `MedmanEchoDriver` (real SOAP-over-HTTP instrument) and `EchoChatterboxDriver`
+  (logs each RPC, no I/O — for dry runs). Select a model with `Echo(host, model="Echo 525")` or
+  inject any driver with `Echo(driver=...)`.
 - `EchoPlateAccessBackend` adapts the Echo driver to the generic `PlateAccess` capability.
 - Application code, web services, and workcell controllers should call the `Echo` frontend or the
   `PlateAccess` capability instead of duplicating Medman transport logic.

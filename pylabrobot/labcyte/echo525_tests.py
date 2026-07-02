@@ -11,15 +11,13 @@ import unittest
 from unittest.mock import patch
 
 from pylabrobot.labcyte.echo import (
+  Echo,
+  EchoDriver,
   EchoDryPlateMode,
   EchoPlateMap,
   EchoSurveyParams,
+  MedmanEchoDriver,
   build_echo_transfer_plan,
-)
-from pylabrobot.labcyte.echo525 import (
-  ECHO_525_TRANSFER_VOLUME_INCREMENT_NL,
-  Echo525,
-  Echo525Driver,
 )
 from pylabrobot.labcyte.echo_mock import EchoMockServer
 from pylabrobot.labcyte.echo_tests import (
@@ -34,23 +32,22 @@ class TestEcho525Defaults(unittest.IsolatedAsyncioTestCase):
   """Pin the device-specific defaults observed on the wire."""
 
   def test_driver_uses_captured_525_defaults(self):
-    driver = Echo525Driver(host="192.168.0.25")
+    driver = MedmanEchoDriver(model="Echo 525", host="192.168.0.25")
     # GetTransferVolIncrNl / GetTransferVolMinimumNl both returned 25 on the device.
     self.assertEqual(driver.transfer_volume_increment_nl, 25.0)
-    self.assertEqual(ECHO_525_TRANSFER_VOLUME_INCREMENT_NL, 25.0)
     # Versions advertised in the instrument's Medman HTTP headers.
     self.assertEqual(driver.protocol_version, "2.6")
     self.assertEqual(driver.client_version, "2.7.3")
 
   def test_device_wires_up_525_driver(self):
-    echo = Echo525(host="192.168.0.25")
-    self.assertIsInstance(echo.driver, Echo525Driver)
+    echo = Echo(model="Echo 525", host="192.168.0.25")
+    self.assertEqual(echo.driver.model, "Echo 525")
     self.assertEqual(echo.driver.transfer_volume_increment_nl, 25.0)
     self.assertEqual(echo.deck.model, "Echo 525")
 
   def test_token_matches_captured_host_header_shape(self):
     # Captured Host header: 192.168.0.25:47500:33224:1780941641:10347
-    token = Echo525Driver.build_token(
+    token = EchoDriver.build_token(
       "192.168.0.25", slot_a=47500, slot_b=33224, epoch=1780941641, pid=10347
     )
     self.assertEqual(token, "192.168.0.25:47500:33224:1780941641:10347")
@@ -64,7 +61,7 @@ class TestEcho525VolumeGranularity(unittest.IsolatedAsyncioTestCase):
   """The 525 dispenses in 25 nL increments; the 650 does 2.5 nL."""
 
   def setUp(self):
-    self.driver = Echo525Driver(host="192.168.0.25")
+    self.driver = MedmanEchoDriver(model="Echo 525", host="192.168.0.25")
     self.source = _make_plate("source", "6RES_AQ_BP2")
     self.destination = _make_plate("destination", "384PP_AQ_BP2")
 
@@ -92,7 +89,7 @@ class TestEcho525WireFormat(unittest.IsolatedAsyncioTestCase):
   """Confirm the bytes we put on the wire match what the Echo 525 expects."""
 
   async def test_rpc_request_matches_captured_medman_framing(self):
-    driver = Echo525Driver(host="192.168.0.25", timeout=1.0)
+    driver = MedmanEchoDriver(model="Echo 525", host="192.168.0.25", timeout=1.0)
     await driver.setup()
 
     fake_writer = _FakeWriter()
@@ -142,7 +139,7 @@ class TestEcho525WireFormat(unittest.IsolatedAsyncioTestCase):
     # The capture's DoWellTransfer dispensed 150 nL from source A2 into every well of a
     # 384-well destination. Reproduce the same source/volume against the 525 builder and
     # confirm the <wp> layout the 525 would emit.
-    driver = Echo525Driver(host="192.168.0.25")
+    driver = MedmanEchoDriver(model="Echo 525", host="192.168.0.25")
     source = _make_plate("source", "6RES_AQ_BP2")
     destination = _make_plate("destination", "384PP_AQ_BP2")
     transfers = [("A2", dn, 150) for dn in ("A1", "B1", "A3")]
@@ -172,7 +169,7 @@ class TestEcho525AgainstMockServer(unittest.IsolatedAsyncioTestCase):
 
   async def test_get_instrument_info_returns_captured_525_identity(self):
     async with EchoMockServer() as srv:
-      echo = Echo525(host=srv.host, rpc_port=srv.port, timeout=5.0)
+      echo = Echo(model="Echo 525", host=srv.host, rpc_port=srv.port, timeout=5.0)
       await echo.setup()
       info = await echo.get_instrument_info()
     self.assertEqual(info.model, "Echo 525")
@@ -181,14 +178,14 @@ class TestEcho525AgainstMockServer(unittest.IsolatedAsyncioTestCase):
 
   async def test_device_reports_25nl_increment_over_the_wire(self):
     async with EchoMockServer() as srv:
-      echo = Echo525(host=srv.host, rpc_port=srv.port, timeout=5.0)
+      echo = Echo(model="Echo 525", host=srv.host, rpc_port=srv.port, timeout=5.0)
       await echo.setup()
       increment = await echo.driver.get_transfer_volume_increment_nl("6RES_AQ_BP2")
     self.assertEqual(increment, 25)
 
   async def test_full_lock_transfer_unlock_flow(self):
     async with EchoMockServer() as srv:
-      echo = Echo525(host=srv.host, rpc_port=srv.port, timeout=5.0)
+      echo = Echo(model="Echo 525", host=srv.host, rpc_port=srv.port, timeout=5.0)
       await echo.setup()
       await echo.driver.lock()
       xml = (
@@ -211,7 +208,7 @@ class TestEcho525AgainstMockServer(unittest.IsolatedAsyncioTestCase):
     # hardware-free validation of that path (the device's PlateSurvey only acks; survey results
     # come back via GetSurveyData, exactly as the mock replays).
     async with EchoMockServer() as srv:
-      echo = Echo525(host=srv.host, rpc_port=srv.port, timeout=5.0)
+      echo = Echo(model="Echo 525", host=srv.host, rpc_port=srv.port, timeout=5.0)
       await echo.setup()
       await echo.driver.lock()
       run = await echo.driver.survey_source_plate(
@@ -251,6 +248,31 @@ class TestEcho525AgainstMockServer(unittest.IsolatedAsyncioTestCase):
       after = srv.response_for("DoWellTransfer")
     self.assertIn("does not own the lock", before)
     self.assertNotIn("does not own the lock", after)
+
+
+class TestEchoDriverArchitecture(unittest.IsolatedAsyncioTestCase):
+  """EchoDriver is an ABC; Medman + Chatterbox are injectable sibling implementations."""
+
+  def test_echodriver_is_abstract(self):
+    from pylabrobot.labcyte.echo import EchoChatterboxDriver
+
+    with self.assertRaises(TypeError):
+      EchoDriver(host="x")  # cannot instantiate the ABC directly
+    self.assertTrue(issubclass(MedmanEchoDriver, EchoDriver))
+    self.assertTrue(issubclass(EchoChatterboxDriver, EchoDriver))
+
+  async def test_inject_chatterbox_driver_runs_without_io(self):
+    from pylabrobot.labcyte.echo import EchoChatterboxDriver
+
+    echo = Echo(driver=EchoChatterboxDriver())  # no host needed; logs instead of I/O
+    await echo.setup()
+    await echo.driver.lock()
+    result = await echo.driver.do_well_transfer(
+      '<?xml version="1.0"?><Protocol Name="t"><Name/>'
+      '<Layout><wp n="A1" dn="A1" v="25"/></Layout></Protocol>'
+    )
+    await echo.driver.unlock()
+    self.assertTrue(result.succeeded)
 
 
 if __name__ == "__main__":
