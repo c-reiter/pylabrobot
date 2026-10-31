@@ -249,10 +249,10 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       result[row_idx][col_idx] = value
     return result
 
-  async def set_plate(self, plate: Plate):
+  async def set_plate(self, plate: Plate) -> Optional[bytes]:
     async with self._operation():
       if plate is self._plate:
-        return
+        return None
       await self._require_rdop22()
 
       rows = plate.num_items_y
@@ -289,7 +289,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         "\x03"
       )
 
-      resp = await self.send_command("y", cmd, timeout=1)
+      resp = await self.send_command("y", cmd, timeout=20)
       parse_response(resp, "y")
       self._plate = plate
       return resp

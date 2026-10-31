@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -329,6 +330,24 @@ class AravisCamera:
       self._height = 0
       self._payload_size = 0
 
+  def get_pixel_max(self) -> int:
+    """Return the maximum code value of the active unpacked monochrome format."""
+    maxima = {0x01080001: 255, 0x01100003: 1023, 0x01100005: 4095, 0x01100007: 65535}
+    pixel_format = self.camera.get_pixel_format()
+    if pixel_format not in maxima:
+      raise NotImplementedError(f"Unsupported camera pixel format: 0x{pixel_format:08x}")
+    return maxima[pixel_format]
+
+  def get_exposure_limits(self) -> tuple[float, float]:
+    """Return the camera's allowed exposure interval in milliseconds."""
+    low, high = self.camera.get_exposure_time_bounds()
+    return float(low) / 1000, float(high) / 1000
+
+  def get_gain_limits(self) -> tuple[float, float]:
+    """Return the camera's allowed analog gain interval in dB."""
+    low, high = self.camera.get_gain_bounds()
+    return float(low), float(high)
+
   async def set_exposure(self, exposure_ms: float) -> None:
     """Set exposure time in milliseconds.
 
@@ -338,6 +357,9 @@ class AravisCamera:
     Args:
         exposure_ms: Exposure time in milliseconds (e.g., 10.0 = 10 ms).
     """
+    low, high = self.get_exposure_limits()
+    if not math.isfinite(exposure_ms) or not low <= exposure_ms <= high:
+      raise ValueError(f"Exposure must be between {low} and {high} ms")
     camera = self.camera
     # Disable auto-exposure before setting manual value.
     self.device.set_string_feature_value("ExposureAuto", "Off")
@@ -359,6 +381,9 @@ class AravisCamera:
     Args:
         gain: Gain value (e.g., 1.0).
     """
+    low, high = self.get_gain_limits()
+    if not math.isfinite(gain) or not low <= gain <= high:
+      raise ValueError(f"Gain must be between {low} and {high} dB")
     camera = self.camera
     self.device.set_string_feature_value("GainAuto", "Off")
     camera.set_gain(gain)

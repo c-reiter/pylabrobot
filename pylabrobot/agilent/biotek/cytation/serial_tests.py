@@ -22,7 +22,7 @@ class TestCytationSerial(unittest.IsolatedAsyncioTestCase):
     transport.reset_input_buffer = AsyncMock()
     transport.reset_output_buffer = AsyncMock()
     transport.write = AsyncMock(return_value=None)
-    response = b"\x061320200  Version 1.12   0000\x03\x0617100919        0000\x03"
+    response = b"\x061320200  Version 1.12   0000\x03\x0617100919        0000\x03\x060000\x03"
     transport.read = AsyncMock(side_effect=[bytes([value]) for value in response])
     reader.io = transport
     with patch.object(reader.microscope, "_on_setup", new_callable=AsyncMock):
@@ -32,6 +32,7 @@ class TestCytationSerial(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(transport.write.await_args_list, [call(b"e"), call(b"C")])
     await reader.stop()
     transport.stop.assert_awaited_once()
+    self.assertEqual(transport.write.await_args_list[-2:], [call(b"i"), call(b"L0001")])
 
   def test_rejects_ambiguous_transport(self) -> None:
     """A COM port and a USB identifier must not silently override each other."""

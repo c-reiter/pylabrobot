@@ -156,3 +156,132 @@ class TestColorBrightfield(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestStage(unittest.IsolatedAsyncioTestCase):
+  """Stage targets retain motor-step precision and use firmware field widths."""
+
+  async def test_offsets_quantize_targets_without_drift(self):
+    backend, driver = _make_backend()
+    backend._position_digits = 6
+    await backend.select(1, 2)
+    for x in (0.004, 0.008, 0.012, 0.016, 0.020, 0.0):
+      await backend.set_position(x, 0)
+    self.assertEqual(
+      driver.send_command.await_args_list,
+      [
+        unittest.mock.call("Y", "W60102", timeout=50),
+        unittest.mock.call("Y", "O00000001", timeout=50),
+        unittest.mock.call("Y", "O00000001", timeout=50),
+        unittest.mock.call("Y", "O00-00002", timeout=50),
+      ],
+    )
+    self.assertEqual((backend._pos_x, backend._pos_y), (0, 0))
+
+  async def test_partial_movement_invalidates_both_coordinates(self):
+    backend, driver = _make_backend()
+    await backend.select(1, 1)
+    driver.send_command.side_effect = [b"0000\x03", RuntimeError("motor error")]
+    with self.assertRaisesRegex(RuntimeError, "motor error"):
+      await backend.set_position(1, 1)
+    self.assertIsNone(backend._pos_x)
+    self.assertIsNone(backend._pos_y)
+
+  async def test_unknown_position_is_recentered(self):
+    backend, driver = _make_backend()
+    backend._row, backend._column = 1, 2
+    await backend.set_position(0.01016, 0)
+    self.assertEqual(
+      driver.send_command.await_args_list,
+      [
+        unittest.mock.call("Y", "W60102", timeout=50),
+        unittest.mock.call("Y", "O000000001", timeout=50),
+      ],
+    )
+
+  async def test_invalid_targets_never_move_stage(self):
+    backend, driver = _make_backend()
+    for x in (float("nan"), float("inf"), 1e308):
+      with self.assertRaises(ValueError):
+        await backend.set_position(x, 0)
+    for row, column in ((0, 1), (1, -1), (100, 1), (1.5, 1)):
+      with self.assertRaises(ValueError):
+        await backend.select(row, column)
+    driver.send_command.assert_not_awaited()
+
+  async def test_focus_calibration_query(self):
+    backend, driver = _make_backend()
+    backend._position_digits = 6
+    backend._objectives = [Objective.O_4X_PL_FL_Phase]
+    backend._objective = Objective.O_4X_PL_FL_Phase
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    driver.send_command.return_value = b"10824470000\x03"
+    self.assertAlmostEqual(await backend.get_focus_reference(), 7.750018)
+    driver.send_command.assert_awaited_once_with(
+      "Y", "Z150" + "0000" + "000000" + "000000", timeout=20
+    )
+    driver.send_command.return_value = b"00824470000\x03"
+    self.assertIsNone(await backend.get_focus_reference())
+
+
+class TestAutomaticImaging(unittest.IsolatedAsyncioTestCase):
+  """Bound automatic searches and never report an unmeasured focus or exposure."""
+
+  async def test_auto_exposure_converges_using_frames(self):
+    from .models import AutoExposure
+
+    backend, _ = _make_backend()
+    backend.camera = unittest.mock.MagicMock()
+    backend.camera.get_exposure_limits.return_value = (0.1, 1000)
+    backend.camera.set_auto_exposure = unittest.mock.AsyncMock()
+    backend.camera.set_exposure = unittest.mock.AsyncMock()
+    backend.get_exposure = unittest.mock.AsyncMock(side_effect=lambda: backend._exposure)
+    backend.acquire_image = unittest.mock.AsyncMock()
+    evaluate = unittest.mock.AsyncMock(side_effect=["higher", "lower", "good"])
+    result = await backend.auto_expose(AutoExposure(evaluate, 3, 1, 100))
+    self.assertAlmostEqual(result, 17.7827941004)
+    self.assertEqual(evaluate.await_count, 3)
+    self.assertFalse(backend._acquiring)
+
+  async def test_auto_exposure_failure_stops_owned_acquisition(self):
+    from .models import AutoExposure
+
+    backend, _ = _make_backend()
+    backend.camera = unittest.mock.MagicMock()
+    backend.camera.get_exposure_limits.return_value = (0.1, 1000)
+    backend.camera.set_auto_exposure = unittest.mock.AsyncMock()
+    backend.camera.set_exposure = unittest.mock.AsyncMock()
+    backend.acquire_image = unittest.mock.AsyncMock()
+    evaluate = unittest.mock.AsyncMock(return_value="higher")
+    with self.assertRaisesRegex(RuntimeError, "No acceptable exposure"):
+      await backend.auto_expose(AutoExposure(evaluate, 3, 1, 100))
+    self.assertEqual(evaluate.await_count, 3)
+    self.assertFalse(backend._acquiring)
+
+  async def test_autofocus_brackets_and_refines_peak(self):
+    from .models import AutoFocus
+
+    backend, _ = _make_backend()
+    backend.camera = unittest.mock.MagicMock()
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    backend._exposure, backend._gain = 10, 0
+    backend.acquire_image = unittest.mock.AsyncMock(side_effect=lambda: backend._focal_height)
+    result = await backend.autofocus(
+      AutoFocus(lambda z: float(-((z - 4.31) ** 2)), 10, 4, 5, 0.001)
+    )
+    self.assertAlmostEqual(result, 4.31, delta=0.001)
+    self.assertEqual(backend._focal_height, result)
+    self.assertFalse(backend._acquiring)
+
+  async def test_autofocus_rejects_flat_and_out_of_range_peaks(self):
+    from .models import AutoFocus
+
+    for evaluate in (lambda z: 1, lambda z: z):
+      backend, _ = _make_backend()
+      backend.camera = unittest.mock.MagicMock()
+      backend._imaging_mode = ImagingMode.BRIGHTFIELD
+      backend._exposure, backend._gain = 10, 0
+      backend.acquire_image = unittest.mock.AsyncMock(side_effect=lambda: backend._focal_height)
+      with self.assertRaises(RuntimeError):
+        await backend.autofocus(AutoFocus(evaluate, 10, 4, 5))
+      self.assertFalse(backend._acquiring)

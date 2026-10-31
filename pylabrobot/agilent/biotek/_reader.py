@@ -12,6 +12,16 @@ from pylabrobot.io.serial import Serial
 logger = logging.getLogger(__name__)
 
 
+class BioTekError(RuntimeError):
+  """A complete instrument response containing a nonzero firmware status."""
+
+  def __init__(self, code: int, command: Optional[str] = None) -> None:
+    self.code = code
+    self.command = command
+    prefix = f"BioTek {command}: " if command is not None else ""
+    super().__init__(f"{prefix}BioTek reported error 0x{code:04X}")
+
+
 class _BioTekReader:
   """Shared BioTek reader behavior, independent of the assay protocol.
 
@@ -123,7 +133,7 @@ class _BioTekReader:
     if re.fullmatch(rb"[0-9a-fA-F]{4}\x03", status) is None:
       raise ValueError(f"Malformed BioTek status: {status!r}")
     if int(status[:4], 16):
-      raise RuntimeError(f"BioTek reported error 0x{status[:4].decode('ascii')}")
+      raise BioTekError(int(status[:4], 16))
 
   async def _read_chunk(self, length: int) -> bytes:
     """Read at most length bytes through the PLR transport."""
@@ -194,8 +204,8 @@ class _BioTekReader:
       response = await self._read_exactly(data_length + 5)
     try:
       self._check_status(response[-5:])
-    except RuntimeError as exc:
-      raise RuntimeError(f"BioTek {command.decode('ascii')}: {exc}") from exc
+    except BioTekError as exc:
+      raise BioTekError(exc.code, command.decode("ascii")) from exc
     return ack + response if parameters is None else response
 
   async def _command(

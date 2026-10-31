@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+from pylabrobot.agilent.biotek._reader import BioTekError
+from pylabrobot.resources import Plate
 
 from pylabrobot.agilent.biotek.cytation.base import _CytationBase
 from pylabrobot.agilent.biotek.cytation.microscope.microscope import (
   CytationImagingConfig,
   CytationMicroscope,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class Cytation5(_CytationBase):
@@ -32,10 +39,67 @@ class Cytation5(_CytationBase):
       use_cam=use_cam,
     )
 
+  def _reset_state(self) -> None:
+    """Discard optics and plate position assumptions after disconnecting."""
+    super()._reset_state()
+    self.microscope._clear_imaging_state()
+
   async def setup(self) -> None:
-    await super().setup()
-    await self.microscope._on_setup()
+    """Connect the controller and optional camera, releasing both on failure."""
+    try:
+      await super().setup()
+      await self.microscope._on_setup()
+    except BaseException:
+      await self.microscope._on_stop()
+      await super().stop()
+      raise
 
   async def stop(self) -> None:
-    await self.microscope._on_stop()
-    await super().stop()
+    """Switch off illumination and release the camera and controller."""
+    try:
+      if self._version is not None:
+        try:
+          await self.microscope.led_off()
+        except Exception:
+          logger.exception("Failed to switch off illumination while stopping Cytation 5")
+    finally:
+      try:
+        await self.microscope._on_stop()
+      finally:
+        await super().stop()
+
+  async def open(self, slow: bool = False) -> None:
+    """Extend the loading tray and invalidate the microscope's sample position."""
+    async with self._operation():
+      await self.microscope.led_off()
+      await super().open(slow=slow)
+      self.microscope._clear_sample_position()
+
+  async def close(self, plate: Optional[Plate] = None, slow: bool = False) -> None:
+    """Retract the tray using the supplied plate geometry."""
+    async with self._operation():
+      await super().close(plate=plate, slow=slow)
+      self.microscope._clear_sample_position()
+
+  async def set_plate(self, plate: Plate) -> Optional[bytes]:
+    """Load plate geometry, cycling the tray if the firmware requires it.
+
+    Cytation 5 can return 0x5B00 when a height change requires the carrier outside
+    the instrument. For that status only, extend the tray, retry the geometry and
+    retract it. Keep the tray area clear when changing plate geometry.
+    """
+    async with self._operation():
+      if plate is self._plate:
+        return None
+      try:
+        response = await super().set_plate(plate)
+      except BioTekError as exc:
+        if exc.code != 0x5B00:
+          raise
+        logger.info("Cytation requires the tray outside to update plate geometry")
+        await self.open()
+        response = await super().set_plate(plate)
+        await self.close()
+        self._plate = plate
+      self.microscope._clear_sample_position()
+      return response

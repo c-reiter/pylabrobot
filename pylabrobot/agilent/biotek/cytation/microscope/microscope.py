@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
 
 from pylabrobot.agilent.biotek.cytation.microscope.models import (
+  AutoExposure,
+  AutoFocus,
   Exposure,
   FocalPosition,
   Gain,
@@ -103,6 +105,7 @@ class CytationMicroscope:
 
   async def _on_setup(self) -> None:
     """Connect camera (if use_cam) and load filters/objectives from firmware."""
+    self._clear_imaging_state()
     if self._use_cam:
       serial = self._camera_serial or (
         self.imaging_config.camera_serial_number if self.imaging_config else None
@@ -110,9 +113,9 @@ class CytationMicroscope:
       await self.camera.setup(serial_number=serial)
       logger.info("Camera connected: %s", self.camera.get_device_info())
 
-    if self._filters is None:
+    if self.imaging_config.filters is None:
       await self._load_filters()
-    if self._objectives is None:
+    if self.imaging_config.objectives is None:
       await self._load_objectives()
     self._focus_resolution = parse_focus_resolution(await self.driver.query_capability(2098))
     self._position_digits = parse_position_digits(await self.driver.query_capability(2102))
@@ -151,6 +154,14 @@ class CytationMicroscope:
     if self._objectives is None:
       raise RuntimeError("Objectives not loaded. Call setup() first.")
     return self._objectives
+
+  def _clear_sample_position(self) -> None:
+    """Forget positions affected by tray movement or a change of plate geometry."""
+    self._row = None
+    self._column = None
+    self._pos_x = None
+    self._pos_y = None
+    self._focal_height = None
 
   def _clear_imaging_state(self) -> None:
     self._exposure = None
@@ -291,6 +302,121 @@ class CytationMicroscope:
           raise
     raise TimeoutError("max_image_read_attempts reached")
 
+  async def auto_expose(self, settings: Optional[AutoExposure] = None) -> float:
+    """Find and retain a bounded exposure, returning milliseconds.
+
+    Illumination, gain, well and focus must already be configured. Without custom
+    settings, place the image's 99th percentile between 60% and 80% of the
+    monochrome pixel range, within the camera's limits and at most 16 frames.
+    Custom settings can evaluate a region or a different fluorescence target.
+    Failure to meet the requested exposure criterion raises RuntimeError.
+    """
+    import numpy as np
+
+    camera_low, camera_high = self.camera.get_exposure_limits()
+    if settings is None:
+
+      async def evaluate(image: Image) -> Literal["higher", "lower", "good"]:
+        """Avoid clipping the brightest structures without amplifying isolated hot pixels."""
+        if image.dtype.kind != "u":
+          raise ValueError("Automatic exposure requires unsigned monochrome images")
+        level = float(np.percentile(image, 99)) / self.camera.get_pixel_max()
+        return "higher" if level < 0.6 else "lower" if level > 0.8 else "good"
+
+      settings = AutoExposure(evaluate, max_rounds=16, low=camera_low, high=camera_high)
+    low, high = settings.low, settings.high
+    if not (math.isfinite(low) and math.isfinite(high) and 0 < low <= high):
+      raise ValueError("Auto-exposure bounds must be finite and 0 < low <= high")
+    if low < camera_low or high > camera_high:
+      raise ValueError("Auto-exposure bounds must lie within the camera's exposure limits")
+    if settings.max_rounds < 1:
+      raise ValueError("Auto-exposure max_rounds must be positive")
+    was_acquiring = self._acquiring
+    async with self.driver._operation():
+      try:
+        if not was_acquiring:
+          self.start_acquisition()
+        for _ in range(settings.max_rounds):
+          exposure = math.sqrt(low) * math.sqrt(high)
+          await self.set_exposure(exposure)
+          result = await settings.evaluate_exposure(await self.acquire_image())
+          if result == "good":
+            return await self.get_exposure()
+          if result == "higher":
+            low = exposure
+          elif result == "lower":
+            high = exposure
+          else:
+            raise ValueError(f"Invalid exposure evaluation: {result!r}")
+        raise RuntimeError("No acceptable exposure found within the configured bounds and rounds")
+      finally:
+        if not was_acquiring:
+          self.stop_acquisition()
+
+  async def autofocus(self, settings: AutoFocus) -> float:
+    """Find and retain the best image focus inside a bounded interval in mm.
+
+    Scan nine evenly spaced positions, then refine around the highest score.
+    The evaluator must return a finite score, with higher values indicating better
+    focus. Exposure and gain must be fixed before calling. Flat scores and peaks
+    at the interval boundary raise instead of claiming a successful focus.
+    ``timeout`` is checked between captures; an in-progress motor/camera operation
+    finishes or reaches its own timeout before the search stops.
+    """
+    low, high, tolerance = settings.low, settings.high, settings.tolerance
+    if not all(math.isfinite(value) for value in (low, high, tolerance, settings.timeout)):
+      raise ValueError("Autofocus bounds, tolerance and timeout must be finite")
+    if not 0 <= low < high or tolerance <= 0 or settings.timeout <= 0:
+      raise ValueError("Autofocus requires 0 <= low < high and positive tolerance and timeout")
+    if high / self.focus_resolution >= 10**self.position_digits:
+      raise ValueError("Autofocus interval exceeds the instrument's focus position field")
+    if self._exposure in (None, "machine-auto") or self._gain in (None, "machine-auto"):
+      raise ValueError("Set a fixed exposure and gain before autofocus")
+    tolerance = max(tolerance, self.focus_resolution)
+    scores: dict[float, float] = {}
+    deadline = time.monotonic() + settings.timeout
+
+    async def evaluate(position: float) -> None:
+      """Capture a previously unmeasured position and reject invalid evaluation scores."""
+      if time.monotonic() >= deadline:
+        raise TimeoutError("Autofocus search timed out")
+      if position in scores:
+        return
+      await self.set_focus(position)
+      score = float(settings.evaluate_focus(await self.acquire_image()))
+      if not math.isfinite(score):
+        raise ValueError("Focus evaluator returned a non-finite score")
+      scores[position] = score
+
+    async def search() -> float:
+      """Bracket the strongest coarse peak and refine both sides to motor precision."""
+      for i in range(9):
+        await evaluate(low + (high - low) * i / 8)
+      if max(scores.values()) == min(scores.values()):
+        raise RuntimeError("Autofocus found no image contrast change across the interval")
+      while True:
+        positions = sorted(scores)
+        best = max(positions, key=lambda position: scores[position])
+        index = positions.index(best)
+        if index == 0 or index == len(positions) - 1:
+          raise RuntimeError("Best focus is at the search boundary; choose a wider interval")
+        left, right = positions[index - 1], positions[index + 1]
+        if right - left <= tolerance:
+          await self.set_focus(best)
+          return best
+        await evaluate((left + best) / 2)
+        await evaluate((best + right) / 2)
+
+    was_acquiring = self._acquiring
+    async with self.driver._operation():
+      try:
+        if not was_acquiring:
+          self.start_acquisition()
+        return await search()
+      finally:
+        if not was_acquiring:
+          self.stop_acquisition()
+
   async def _set_color_brightfield_led(self, led_code: int, intensity: int) -> None:
     """Switch color-brightfield illumination to a single LED color and strobe it.
 
@@ -376,6 +502,7 @@ class CytationMicroscope:
     # Color brightfield has no single LED state; its colors are cycled per frame during
     # acquisition (see _acquire_color_brightfield_image).
     self._imaging_mode = mode
+    self._focal_height = None
     if mode != ImagingMode.COLOR_BRIGHTFIELD:
       await self.led_on(intensity=led_intensity)
 
@@ -431,53 +558,92 @@ class CytationMicroscope:
     """Turn off LED."""
     await self.driver.send_command("i", "L0001")
 
+  def _stage_counts(self, position: float) -> int:
+    """Quantize a stage offset in mm to the Cytation's 10.16 µm motor steps."""
+    if not math.isfinite(position):
+      raise ValueError("Stage offsets must be finite")
+    raw_counts = position / 0.01016
+    if not math.isfinite(raw_counts) or abs(raw_counts) >= 10**self.position_digits:
+      raise ValueError("Stage offset exceeds the instrument's position field")
+    counts = round(raw_counts)
+    if len(f"{counts:0{self.position_digits}d}") > self.position_digits:
+      raise ValueError("Stage offset exceeds the instrument's position field")
+    return counts
+
   async def select(self, row: int, column: int) -> None:
-    """Move plate stage to a well position."""
-    if row == self._row and column == self._column:
-      return
-    row_str = str(row).zfill(2)
-    col_str = str(column).zfill(2)
-    await self.driver.send_command("Y", f"W6{row_str}{col_str}")
-    self._row, self._column = row, column
-    self._pos_x, self._pos_y = None, None
-    await self.set_position(0, 0)
+    """Select a well using one-based row and column numbers and center the stage."""
+    if not isinstance(row, int) or not isinstance(column, int):
+      raise ValueError("Row and column must be integers")
+    if not 1 <= row <= 99 or not 1 <= column <= 99:
+      raise ValueError("Row and column must be between 1 and 99")
+    async with self.driver._operation():
+      if row == self._row and column == self._column and self._pos_x is not None:
+        return
+      await self.driver.send_command("Y", f"W6{row:02d}{column:02d}", timeout=50)
+      self._row, self._column = row, column
+      self._pos_x, self._pos_y = 0.0, 0.0
 
   async def set_position(self, x: float, y: float) -> None:
-    """Fine-position the plate stage within a well (mm)."""
-    if self._imaging_mode is None:
-      raise ValueError("Imaging mode not set. Call set_imaging_mode() first.")
+    """Move to offsets in mm from the selected well center.
 
-    if x == self._pos_x and y == self._pos_y:
-      return
-
-    x_str = str(round(x * 100 * 0.984)).zfill(6)
-    y_str = str(round(y * 100 * 0.984)).zfill(6)
-
+    Targets are quantized before calculating relative moves, so repeated sub-step
+    requests cannot accumulate rounding error. An unknown position is re-centered
+    before applying offsets.
+    """
+    x_counts, y_counts = self._stage_counts(x), self._stage_counts(y)
     if self._row is None or self._column is None:
       raise ValueError("Row and column not set. Call select() first.")
-    row_str = str(self._row).zfill(2)
-    column_str = str(self._column).zfill(2)
+    async with self.driver._operation():
+      if self._pos_x is None or self._pos_y is None:
+        await self.select(self._row, self._column)
+      assert self._pos_x is not None and self._pos_y is not None
+      dx = x_counts - self._stage_counts(self._pos_x)
+      dy = y_counts - self._stage_counts(self._pos_y)
+      for delta in (dx, dy):
+        if len(f"{delta:0{self.position_digits}d}") > self.position_digits:
+          raise ValueError("Relative stage movement exceeds the position field")
+      try:
+        if dx:
+          await self.driver.send_command("Y", f"O00{dx:0{self.position_digits}d}", timeout=50)
+        if dy:
+          await self.driver.send_command("Y", f"O01{dy:0{self.position_digits}d}", timeout=50)
+      except BaseException:
+        self._pos_x, self._pos_y = None, None
+        raise
+      self._pos_x, self._pos_y = x_counts * 0.01016, y_counts * 0.01016
+      if dx or dy:
+        await asyncio.sleep(0.1)
 
-    if self._objective is None:
-      raise ValueError("Objective not set. Call set_objective() first.")
-    objective_code = self._objective_code(self._objective)
-    imaging_mode_code = self._imaging_mode_code(self._imaging_mode)
-    await self.driver.send_command(
+  async def get_focus_reference(self, at_position: bool = False) -> Optional[float]:
+    """Read the calibrated focus reference in mm without moving the focus motor.
+
+    By default this returns the objective/filter pair's factory reference. With
+    ``at_position=True``, query its calibration at the selected well and offset.
+    A reference is a starting point for focusing, not a measurement of the sample.
+    Returns None when the instrument has no valid calibration for this combination.
+    """
+    if self._objective is None or self._imaging_mode is None:
+      raise ValueError("Set an objective and imaging mode before querying focus calibration")
+    row = column = x = y = 0
+    if at_position:
+      if self._row is None or self._column is None or self._pos_x is None or self._pos_y is None:
+        raise ValueError("Select a well and position before querying its focus calibration")
+      row, column = self._row, self._column
+      x, y = self._stage_counts(self._pos_x), self._stage_counts(self._pos_y)
+    objective = self._objective_code(self._objective)
+    cube = self._imaging_mode_code(self._imaging_mode)
+    mode = 6 if at_position else 0
+    response = await self.driver.send_command(
       "Y",
-      f"Z{objective_code}{imaging_mode_code}6{row_str}{column_str}{y_str}{x_str}",
+      f"Z{objective}{cube}{mode}{row:02d}{column:02d}"
+      f"{y:0{self.position_digits}d}{x:0{self.position_digits}d}",
+      timeout=20,
     )
-
-    relative_x = x - (self._pos_x or 0)
-    relative_y = y - (self._pos_y or 0)
-    if relative_x != 0:
-      relative_x_str = str(round(relative_x * 100 * 0.984)).zfill(6)
-      await self.driver.send_command("Y", f"O00{relative_x_str}")
-    if relative_y != 0:
-      relative_y_str = str(round(relative_y * 100 * 0.984)).zfill(6)
-      await self.driver.send_command("Y", f"O01{relative_y_str}")
-
-    self._pos_x, self._pos_y = x, y
-    await asyncio.sleep(0.1)
+    if response is None or len(response) != self.position_digits + 6:
+      raise ValueError(f"Malformed focus calibration response: {response!r}")
+    if response[:1] not in (b"0", b"1") or not response[1:-5].isdigit():
+      raise ValueError(f"Malformed focus calibration response: {response!r}")
+    return int(response[1:-5]) * self.focus_resolution if response[:1] == b"1" else None
 
   async def capture(
     self,
@@ -485,8 +651,8 @@ class CytationMicroscope:
     column: int,
     mode: ImagingMode,
     objective: Objective,
-    exposure_time: Exposure,
-    focal_height: FocalPosition,
+    exposure_time: Union[Exposure, AutoExposure],
+    focal_height: Union[FocalPosition, AutoFocus],
     gain: Gain,
     plate: Plate,
     led_intensity: int = 10,
@@ -519,9 +685,20 @@ class CytationMicroscope:
       await self.set_objective(objective)
       await self.set_imaging_mode(mode, led_intensity=led_intensity)
       await self.select(row, column)
-      await self.set_exposure(exposure_time)
       await self.set_gain(gain)
-      await self.set_focus(focal_height)
+      if isinstance(focal_height, AutoFocus):
+        if isinstance(exposure_time, AutoExposure) or exposure_time == "machine-auto":
+          raise ValueError("Image autofocus requires a fixed exposure")
+        await self.set_exposure(exposure_time)
+        await self.autofocus(focal_height)
+      else:
+        await self.set_focus(focal_height)
+        if isinstance(exposure_time, AutoExposure):
+          await self.auto_expose(exposure_time)
+        elif exposure_time == "machine-auto":
+          await self.auto_expose()
+        else:
+          await self.set_exposure(exposure_time)
 
       def image_size(magnification: float) -> Tuple[float, float]:
         if magnification == 4:
