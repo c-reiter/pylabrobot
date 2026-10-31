@@ -280,7 +280,9 @@ class Serial(IOBase):
     if self._executor is None or self._ser is None:
       raise RuntimeError(f"Call setup() first for device '{self.human_readable_device_name}'.")
 
-    await loop.run_in_executor(self._executor, self._ser.write, data)
+    written = await loop.run_in_executor(self._executor, self._ser.write, data)
+    if written != len(data):
+      raise IOError(f"Incomplete serial write: sent {written} of {len(data)} bytes")
 
     logger.log(LOG_LEVEL_IO, "[%s] write %s", self._port, data)
     capturer.record(

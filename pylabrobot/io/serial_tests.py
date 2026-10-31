@@ -1,8 +1,26 @@
 import types
 import unittest
-from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, patch
 
-from pylabrobot.io.serial import find_serial_ports
+from pylabrobot.io.serial import Serial, find_serial_ports
+
+
+class TestSerialWrites(unittest.IsolatedAsyncioTestCase):
+  """A short host write must not be reported as a complete device command."""
+
+  async def test_short_write_raises_before_recording_success(self) -> None:
+    """Preserve the failure so a driver can close the incomplete exchange."""
+    connection = Serial("test device", port="test-port")
+    connection._ser = MagicMock()
+    connection._ser.write.return_value = 2
+    with ThreadPoolExecutor(max_workers=1) as executor:
+      connection._executor = executor
+      with patch("pylabrobot.io.serial.capturer.record") as record:
+        with self.assertRaisesRegex(IOError, "sent 2 of 4 bytes"):
+          await connection.write(b"test")
+        record.assert_not_called()
+    connection._executor = None
 
 
 class TestSerialDiscovery(unittest.TestCase):

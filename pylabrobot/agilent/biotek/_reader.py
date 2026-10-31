@@ -4,9 +4,10 @@ import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, Optional, Union
 
 from pylabrobot.io.ftdi import FTDI
+from pylabrobot.io.serial import Serial
 
 logger = logging.getLogger(__name__)
 
@@ -15,14 +16,32 @@ class _BioTekReader:
   """Shared BioTek reader behavior, independent of the assay protocol.
 
   The connection lock covers complete operations, including asynchronous results.
-  Model classes supply initialization and assay formats. FTDI owns connection state.
+  Model classes supply initialization and assay formats. The transport owns connection state.
   """
 
   def __init__(
-    self, timeout: float, device_id: Optional[str], human_readable_device_name: str
+    self,
+    timeout: float,
+    device_id: Optional[str],
+    human_readable_device_name: str,
+    port: Optional[str] = None,
   ) -> None:
     self.timeout = timeout
-    self.io = FTDI(device_id=device_id, human_readable_device_name=human_readable_device_name)
+    if port is not None and device_id is not None:
+      raise ValueError("Specify either a serial port or an FTDI device_id, not both")
+    self.io: Union[FTDI, Serial]
+    if port is None:
+      self.io = FTDI(device_id=device_id, human_readable_device_name=human_readable_device_name)
+    else:
+      self.io = Serial(
+        port=port,
+        human_readable_device_name=human_readable_device_name,
+        baudrate=9600,
+        stopbits=2,
+        rtscts=True,
+        timeout=0.05,
+        write_timeout=timeout,
+      )
     self._lock: Optional[asyncio.Lock] = None
     self._operation_owner: Optional[asyncio.Task] = None
     self._basecode: Optional[str] = None
@@ -87,6 +106,8 @@ class _BioTekReader:
 
   async def _configure_serial(self) -> None:
     """Configure the common BioTek 9600-baud, 8N2, RTS/CTS connection settings."""
+    if isinstance(self.io, Serial):
+      return  # Serial applies the connection settings when opening the port.
     await self.io.set_latency_timer(16)
     await self.io.set_baudrate(9600)
     await self.io.set_line_property(8, 2, 0)
@@ -142,6 +163,9 @@ class _BioTekReader:
 
   async def _write(self, data: bytes) -> None:
     """Send a complete frame, rejecting partial writes."""
+    if isinstance(self.io, Serial):
+      await self.io.write(data)
+      return
     if await self.io.write(data) != len(data):
       raise IOError("Incomplete BioTek command write")
 

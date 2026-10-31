@@ -21,8 +21,9 @@ class Cytation5(_CytationBase):
     device_id: Optional[str] = None,
     imaging_config: Optional[CytationImagingConfig] = None,
     use_cam: bool = True,
+    port: Optional[str] = None,
   ):
-    super().__init__(name=name, device_id=device_id)
+    super().__init__(name=name, device_id=device_id, port=port)
 
     self.microscope = CytationMicroscope(
       driver=self,

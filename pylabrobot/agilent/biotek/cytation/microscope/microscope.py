@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import re
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
@@ -30,6 +29,7 @@ from pylabrobot.agilent.biotek.cytation.microscope.models import (
 from pylabrobot.resources.plate import Plate
 
 from .aravis_camera import AravisCamera
+from .configuration import CytationObjectiveConfiguration, parse_objective_configuration
 
 if TYPE_CHECKING:
   from pylabrobot.agilent.biotek.plate_reader_base import BioTekPlateReaderDriver
@@ -82,6 +82,7 @@ class CytationMicroscope:
     # Imaging state
     self._filters: Optional[List[Optional[ImagingMode]]] = self.imaging_config.filters
     self._objectives: Optional[List[Optional[Objective]]] = self.imaging_config.objectives
+    self._objective_configurations: List[Optional[CytationObjectiveConfiguration]] = []
     self._exposure: Optional[Exposure] = None
     self._focal_height: Optional[FocalPosition] = None
     self._gain: Optional[Gain] = None
@@ -182,105 +183,30 @@ class CytationMicroscope:
 
     logger.info("Loaded filters: %s", self._filters)
 
+  @property
+  def objective_configurations(self) -> List[Optional[CytationObjectiveConfiguration]]:
+    """Return configured turret slots, retaining labels for unknown objective models."""
+    return list(self._objective_configurations)
+
   async def _load_objectives(self) -> None:
-    """Discover installed objective positions from firmware."""
-    weird_encoding = {
-      0x00: " ",
-      0x14: ".",
-      0x15: "/",
-      0x16: "0",
-      0x17: "1",
-      0x18: "2",
-      0x19: "3",
-      0x20: "4",
-      0x21: "5",
-      0x22: "6",
-      0x23: "7",
-      0x24: "8",
-      0x25: "9",
-      0x33: "A",
-      0x34: "B",
-      0x35: "C",
-      0x36: "D",
-      0x37: "E",
-      0x38: "F",
-      0x39: "G",
-      0x40: "H",
-      0x41: "I",
-      0x42: "J",
-      0x43: "K",
-      0x44: "L",
-      0x45: "M",
-      0x46: "N",
-      0x47: "O",
-      0x48: "P",
-      0x49: "Q",
-      0x50: "R",
-      0x51: "S",
-      0x52: "T",
-      0x53: "U",
-      0x54: "V",
-      0x55: "W",
-      0x56: "X",
-      0x57: "Y",
-      0x58: "Z",
-    }
-    part_number2objective = {
-      "uplsapo 40x2": Objective.O_40X_PL_APO,
-      "lucplfln 60X": Objective.O_60X_PL_FL,
-      "uplfln 4x": Objective.O_4X_PL_FL,
-      "lucplfln 20xph": Objective.O_20X_PL_FL_Phase,
-      "lucplfln 40xph": Objective.O_40X_PL_FL_Phase,
-      "u plan": Objective.O_2_5X_PL_ACH_Meiji,
-      "uplfln 10xph": Objective.O_10X_PL_FL_Phase,
-      "plapon 1.25x": Objective.O_1_25X_PL_APO,
-      "uplfln 10x": Objective.O_10X_PL_FL,
-      "uplfln 60xoi": Objective.O_60X_OIL_PL_FL,
-      "pln 4x": Objective.O_4X_PL_ACH,
-      "pln 40x": Objective.O_40X_PL_ACH,
-      "lucplfln 40x": Objective.O_40X_PL_FL,
-      "ec-h-plan/2x": Objective.O_2X_PL_ACH_Motic,
-      "uplfln 100xO2": Objective.O_100X_OIL_PL_FL,
-      "uplfln 4xph": Objective.O_4X_PL_FL_Phase,
-      "lucplfln 20X": Objective.O_20X_PL_FL,
-      "pln 20x": Objective.O_20X_PL_ACH,
-      "fluar 2.5x/0.12": Objective.O_2_5X_FL_Zeiss,
-      "uplsapo 100xo": Objective.O_100X_OIL_PL_APO,
-      "plapon 60xo": Objective.O_60X_OIL_PL_APO,
-      "uplsapo 20x": Objective.O_20X_PL_APO,
-    }
-
-    self._objectives = []
-    version = self.driver.version
-    if version.startswith("1"):
-      for slot in [1, 2]:
-        configuration = await self.driver.send_command("i", f"o{slot}")
-        if configuration is None:
-          raise RuntimeError("Failed to load objective configuration")
-        middle_part = re.split(r"\s+", configuration.rstrip(b"\x03").decode("utf-8"))[1]
-        if middle_part == "0000":
-          self._objectives.append(None)
-        else:
-          part_number = "".join([weird_encoding[x] for x in bytes.fromhex(middle_part)])
-          self._objectives.append(part_number2objective.get(part_number.lower(), None))
-    elif version.startswith("2"):
-      for slot in range(1, 7):
-        configuration = await self.driver.send_command("i", f"h{slot + 1}")
-        assert configuration is not None
-        if configuration.startswith(b"****"):
-          self._objectives.append(None)
-        else:
-          annulus_code = int(configuration.decode("latin").strip().split(" ")[0])
-          annulus2objective = {
-            1320520: Objective.O_4X_PL_FL_Phase,
-            1320521: Objective.O_20X_PL_FL_Phase,
-            1322026: Objective.O_40X_PL_FL_Phase,
-          }
-          self._objectives.append(annulus2objective.get(annulus_code, None))
-    else:
-      raise RuntimeError(f"Unsupported firmware version: {version}")
-
-    logger.info("Loaded objectives: %s", self._objectives)
+    """Read all six objective slots from the objective turret's configuration."""
+    configurations: List[Optional[CytationObjectiveConfiguration]] = []
+    for slot in range(1, 7):
+      response = await self.driver.send_command("i", f"o{slot}")
+      if response is None:
+        raise RuntimeError("Failed to load objective configuration")
+      configuration = parse_objective_configuration(response[:-5])
+      if configuration is not None and configuration.objective is None:
+        logger.warning(
+          "Unrecognized objective in slot %d: %s %s",
+          slot,
+          configuration.manufacturer,
+          configuration.part_number,
+        )
+      configurations.append(configuration)
+    self._objective_configurations = configurations
+    self._objectives = [item.objective if item is not None else None for item in configurations]
+    logger.info("Configured objectives: %s", self._objectives)
 
   # ─── Camera Control ──────────────────────────────────────────────────
 

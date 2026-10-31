@@ -20,6 +20,7 @@ from pylabrobot.agilent.biotek.results import (
 from pylabrobot.agilent.biotek.results import (
   LuminescenceResult as LuminescenceResult,
 )
+from pylabrobot.io.serial import Serial
 from pylabrobot.resources import Plate, Well
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,9 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     timeout: float = 20,
     device_id: Optional[str] = None,
     human_readable_device_name: str = "Agilent BioTek",
+    port: Optional[str] = None,
   ) -> None:
-    super().__init__(timeout, device_id, human_readable_device_name)
+    super().__init__(timeout, device_id, human_readable_device_name, port=port)
 
     self._plate: Optional[Plate] = None
     self._shaking = False
@@ -75,7 +77,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
 
   async def _configure_serial(self) -> None:
     """Reset the adapter before applying the RDOP22 readers' serial settings."""
-    await self.io.usb_reset()
+    if not isinstance(self.io, Serial):
+      await self.io.usb_reset()
     await super()._configure_serial()
 
   async def _initialize_reader(self) -> None:
@@ -83,7 +86,12 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     try:
       await super()._initialize_reader()
     except TimeoutError:
-      await self.io.set_baudrate(38_461)
+      if isinstance(self.io, Serial):
+        await self.io.stop()
+        self.io.baudrate = 38_461
+        await self.io.setup()
+      else:
+        await self.io.set_baudrate(38_461)
       await super()._initialize_reader()
 
   @property
@@ -123,6 +131,10 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
   async def _purge_buffers(self) -> None:
     """Clear pending adapter data before an RDOP22 command."""
     self._receive_buffer.clear()
+    if isinstance(self.io, Serial):
+      await self.io.reset_input_buffer()
+      await self.io.reset_output_buffer()
+      return
     for _ in range(6):
       await self.io.usb_purge_rx_buffer()
     await self.io.usb_purge_tx_buffer()
@@ -321,7 +333,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
 
       logger.info(
         "[BioTek %s] read_absorbance: plate=%s, wavelength=%dnm, wells=%d",
-        self.io.device_id,
+        self.io.port if isinstance(self.io, Serial) else self.io.device_id,
         plate.name,
         wavelength,
         len(wells),
@@ -387,7 +399,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     async with self._operation():
       logger.info(
         "[BioTek %s] read_luminescence: plate=%s, wells=%d",
-        self.io.device_id,
+        self.io.port if isinstance(self.io, Serial) else self.io.device_id,
         plate.name,
         len(wells),
       )
@@ -463,7 +475,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     async with self._operation():
       logger.info(
         "[BioTek %s] read_fluorescence: plate=%s, excitation=%dnm, emission=%dnm, wells=%d",
-        self.io.device_id,
+        self.io.port if isinstance(self.io, Serial) else self.io.device_id,
         plate.name,
         excitation_wavelength,
         emission_wavelength,
