@@ -19,6 +19,7 @@ from pylabrobot.agilent.biotek.plate_reader_protocol import (
 TEST_DATA = Path(__file__).parent / "test_data"
 PACKET_VECTORS = json.loads((TEST_DATA / "absorbance_packets.json").read_text())["vectors"]
 LEGACY_CAPTURE = json.loads((TEST_DATA / "synergy_ht_identity.json").read_text())
+TRF_CAPTURE = json.loads((TEST_DATA / "cytation5_trf_reference.json").read_text())
 SUPPORTED = b"10000000000000000"
 UNSUPPORTED = b"00000000000000000"
 ASSAY_REPLY = b"0350000000000000010000000000490300000\x03"
@@ -82,6 +83,27 @@ def test_invalid_time_resolved_fields(delay: int, collection: int) -> None:
   """Timing limits also protect the low-level encoder."""
   with pytest.raises(ValueError):
     encode_fluorescence((1, 3, 1, 3), 360, 620, delay, collection)
+
+
+def test_captured_cytation_trf_frame() -> None:
+  """Match the vendor capture apart from its automatic gain of 200 versus fixed 100."""
+  reference = TRF_CAPTURE["packet"]
+  packet = encode_fluorescence(
+    tuple(TRF_CAPTURE["bounds"]),
+    TRF_CAPTURE["excitation_wavelength"],
+    TRF_CAPTURE["emission_wavelength"],
+    TRF_CAPTURE["delay_microseconds"],
+    TRF_CAPTURE["collection_microseconds"],
+  )
+  assert packet[:-7] == reference[:-7]
+  assert packet[-7:-4] == "100"
+  assert reference[-7:-4] == "200"
+  assert packet[-4] == reference[-4] == "1"
+  assert packet[-3:] == "105"
+  assert reference[-3:] == "106"
+  assert parse_assay_response(bytes.fromhex(TRF_CAPTURE["assay_reply_hex"])) == (
+    b"000000000000001000000000000"
+  )
 
 
 def test_assay_reply() -> None:
@@ -232,6 +254,15 @@ class TestReaderNegotiation(unittest.IsolatedAsyncioTestCase):
             else:
               await self.reader.read_luminescence(self.plate, self.plate["A1"], 6, 0.2)
           assert call("O") not in self.reader.send_command.call_args_list
+
+  async def test_captured_trf_result(self) -> None:
+    """The recorded successful A3 read is parsed into the correct plate position."""
+    self.reader._plate = self.plate
+    acquired = bytes.fromhex(TRF_CAPTURE["acquisition_reply_hex"])
+    assert acquired[:6] == b"\x060000\x03"
+    data = self.reader._parse_body(acquired[6:])
+    assert data[0][2] == 1
+    assert sum(value is not None for row in data for value in row) == 1
 
   async def test_invalid_luminescence_time_does_not_touch_hardware(self) -> None:
     """Reject invalid exposures before geometry or focus can move the instrument."""
