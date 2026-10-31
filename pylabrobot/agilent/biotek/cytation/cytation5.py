@@ -108,7 +108,6 @@ class Cytation5(_CytationBase):
 
     Uses ten flashes, 20 nm bandwidths and gain 100. Timing is performed by the
     instrument after each excitation flash, rather than by host-side sleeps.
-    This operation has not yet been validated on hardware.
 
     Args:
       plate: Plate to read.
@@ -134,7 +133,6 @@ class Cytation5(_CytationBase):
       capability = await self.query_capability(2006)
       if capability[:1] != b"1" or capability[2:3] != b"1":
         raise NotImplementedError("This Cytation has no monochromator time-resolved fluorescence")
-      logger.warning("Cytation time-resolved fluorescence has not yet been validated on hardware")
       return await self._read_fluorescence(
         plate,
         wells,
