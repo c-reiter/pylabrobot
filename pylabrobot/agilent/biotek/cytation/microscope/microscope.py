@@ -336,32 +336,19 @@ class CytationMicroscope:
     await self.led_off()
     filter_index = self._imaging_mode_code(mode)
 
-    if self.driver.version.startswith("1"):
-      if mode == ImagingMode.PHASE_CONTRAST:
-        raise NotImplementedError("Phase contrast not implemented on Cytation 1")
-      elif mode == ImagingMode.COLOR_BRIGHTFIELD:
-        raise NotImplementedError("Color brightfield not implemented on Cytation 1")
-      elif mode == ImagingMode.BRIGHTFIELD:
-        await self.driver.send_command("Y", "P0c05")
-        await self.driver.send_command("Y", "P0f02")
-      else:
-        await self.driver.send_command("Y", f"P0c{filter_index:02}")
-        await self.driver.send_command("Y", "P0f01")
+    if mode == ImagingMode.PHASE_CONTRAST:
+      # Position 20 selects the configured annulus for the current objective.
+      await self.driver.send_command("Y", "P1120")
+      await self.driver.send_command("Y", "P0d05")
+      await self.driver.send_command("Y", "P1002")
+    elif mode in (ImagingMode.BRIGHTFIELD, ImagingMode.COLOR_BRIGHTFIELD):
+      await self.driver.send_command("Y", "P1101")
+      await self.driver.send_command("Y", "P0d05")
+      await self.driver.send_command("Y", "P1002")
     else:
-      if mode == ImagingMode.PHASE_CONTRAST:
-        await self.driver.send_command("Y", "P1120")
-        await self.driver.send_command("Y", "P0d05")
-        await self.driver.send_command("Y", "P1002")
-      elif mode in (ImagingMode.BRIGHTFIELD, ImagingMode.COLOR_BRIGHTFIELD):
-        # Color brightfield uses the same light path as brightfield; the three colors are
-        # selected via LED codes during acquisition.
-        await self.driver.send_command("Y", "P1101")
-        await self.driver.send_command("Y", "P0d05")
-        await self.driver.send_command("Y", "P1002")
-      else:
-        await self.driver.send_command("Y", "P1101")
-        await self.driver.send_command("Y", f"P0d{filter_index:02}")
-        await self.driver.send_command("Y", "P1001")
+      await self.driver.send_command("Y", "P1101")
+      await self.driver.send_command("Y", f"P0d{filter_index:02}")
+      await self.driver.send_command("Y", "P1001")
 
     # Color brightfield has no single LED state; its colors are cycled per frame during
     # acquisition (see _acquire_color_brightfield_image).
@@ -374,10 +361,7 @@ class CytationMicroscope:
     if objective == self._objective:
       return
     obj_code = self._objective_code(objective)
-    if self.driver.version.startswith("1"):
-      await self.driver.send_command("Y", f"P0d{obj_code:02}", timeout=60)
-    else:
-      await self.driver.send_command("Y", f"P0e{obj_code:02}", timeout=60)
+    await self.driver.send_command("Y", f"P0e{obj_code:02}", timeout=60)
     self._objective = objective
     self._imaging_mode = None  # force re-set after objective change
     self._focal_height = None

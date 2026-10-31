@@ -126,11 +126,22 @@ class TestColorBrightfield(unittest.IsolatedAsyncioTestCase):
     self.assertEqual([p for (ch, p) in sent if ch == "i"], ["L0001"])
     self.assertEqual(backend._imaging_mode, ImagingMode.COLOR_BRIGHTFIELD)
 
-  async def test_color_brightfield_not_supported_on_cytation1(self):
-    backend, _ = _make_backend(version="1.05")
-    backend._imaging_mode = None
-    with self.assertRaises(NotImplementedError):
-      await backend.set_imaging_mode(ImagingMode.COLOR_BRIGHTFIELD, led_intensity=10)
+  async def test_cytation5_firmware_one_uses_six_objective_motor_addresses(self):
+    """Firmware 1.x is also used by Cytation 5 and must retain its optics commands."""
+    for mode in (ImagingMode.COLOR_BRIGHTFIELD, ImagingMode.PHASE_CONTRAST, ImagingMode.DAPI):
+      with self.subTest(mode=mode):
+        backend, driver = _make_backend(version="1.12")
+        backend._imaging_mode = None
+        backend._objective = None
+        backend._objectives = [Objective.O_4X_PL_ACH]
+        backend._filters = [None, ImagingMode.DAPI, None, None]
+        await backend.set_objective(Objective.O_4X_PL_ACH)
+        await backend.set_imaging_mode(mode)
+        driver.send_command.assert_any_await("Y", "P0e01", timeout=60)
+        ring = "P1120" if mode == ImagingMode.PHASE_CONTRAST else "P1101"
+        driver.send_command.assert_any_await("Y", ring)
+        cube = "P0d02" if mode == ImagingMode.DAPI else "P0d05"
+        driver.send_command.assert_any_await("Y", cube)
 
 
 if __name__ == "__main__":
