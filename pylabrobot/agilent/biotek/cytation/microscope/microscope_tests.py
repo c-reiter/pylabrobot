@@ -228,6 +228,30 @@ class TestStage(unittest.IsolatedAsyncioTestCase):
 class TestAutomaticImaging(unittest.IsolatedAsyncioTestCase):
   """Bound automatic searches and never report an unmeasured focus or exposure."""
 
+  async def test_color_auto_exposure_evaluates_illuminated_rgb(self):
+    """The exposure evaluator receives three lit channels rather than a dark mono frame."""
+    from .models import AutoExposure
+
+    backend, driver = _make_backend()
+    backend.camera = unittest.mock.MagicMock()
+    backend.camera.get_exposure_limits.return_value = (0.1, 1000)
+    backend.camera.set_auto_exposure = unittest.mock.AsyncMock()
+    backend.camera.set_exposure = unittest.mock.AsyncMock()
+    backend.get_exposure = unittest.mock.AsyncMock(side_effect=lambda: backend._exposure)
+    backend.acquire_image = unittest.mock.AsyncMock(
+      side_effect=[np.full((2, 3), v, dtype=np.uint8) for v in (10, 50, 200)]
+    )
+    await backend.set_imaging_mode(ImagingMode.COLOR_BRIGHTFIELD, led_intensity=2)
+    driver.send_command.reset_mock()
+    evaluate = unittest.mock.AsyncMock(return_value="good")
+    await backend.auto_expose(AutoExposure(evaluate, 1, 1, 100))
+    assert evaluate.await_args is not None
+    np.testing.assert_array_equal(evaluate.await_args.args[0][0, 0], [10, 50, 200])
+    self.assertEqual(backend.acquire_image.await_count, 3)
+    driver.send_command.assert_any_await("i", "L0602")
+    driver.send_command.assert_any_await("i", "L0702")
+    driver.send_command.assert_any_await("i", "L0802")
+
   async def test_auto_exposure_converges_using_frames(self):
     from .models import AutoExposure
 
@@ -320,7 +344,7 @@ class TestMontage(unittest.IsolatedAsyncioTestCase):
     from pylabrobot.resources import cor_96_wellplate_360uL_Fb
 
     backend, driver = _make_backend()
-    driver.set_plate = unittest.mock.AsyncMock()
+    driver._prepare_microscopy = unittest.mock.AsyncMock()
     backend._objectives = [Objective.O_4X_PL_FL_Phase]
     backend.camera = unittest.mock.MagicMock()
     backend.camera.width, backend.camera.height = 1384, 1036

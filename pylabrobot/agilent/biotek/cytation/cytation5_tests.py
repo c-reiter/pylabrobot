@@ -69,19 +69,43 @@ class TestCytationLifecycle(unittest.IsolatedAsyncioTestCase):
       stop.assert_awaited_once()
     camera_stop.assert_awaited_once()
 
+  async def test_capture_preparation_recloses_after_assay(self):
+    reader = Cytation5("reader", use_cam=False)
+    plate = cor_96_wellplate_360uL_Fb("plate")
+    with (
+      patch.object(reader, "close", new_callable=AsyncMock) as close,
+      patch.object(reader, "set_plate", new_callable=AsyncMock) as geometry,
+      patch.object(reader.microscope, "led_off", new_callable=AsyncMock),
+    ):
+      reader._tray_closed = True
+      await reader._prepare_microscopy(plate)
+      geometry.assert_awaited_once_with(plate)
+      close.assert_not_awaited()
+      await reader._prepare_plate_read()
+      await reader._prepare_microscopy(plate)
+      close.assert_awaited_once_with(plate=plate)
+
 
 class TestCytationTemperature(unittest.IsolatedAsyncioTestCase):
   """Heater targets can be reduced without requiring active cooling."""
 
   async def test_heating_range_and_passive_cooling(self):
     reader = Cytation5("reader", use_cam=False)
-    with patch.object(reader, "send_command", new_callable=AsyncMock) as command:
+    with (
+      patch.object(reader, "query_capability", new_callable=AsyncMock) as capability,
+      patch.object(reader, "send_command", new_callable=AsyncMock) as command,
+    ):
+      capability.side_effect = lambda code: b"0" * 17 if code == 2126 else b"1402" + b"0" * 13
       await reader.set_temperature(37)
-      command.assert_awaited_with("g", "37000")
+      command.assert_awaited_with("g", "370", timeout=40)
       await reader.set_temperature(25)
-      command.assert_awaited_with("g", "25000")
+      command.assert_awaited_with("g", "250", timeout=40)
       await reader.set_temperature(65)
-      command.assert_awaited_with("g", "65000")
+      command.assert_awaited_with("g", "650", timeout=40)
+      await reader.set_temperature(30, gradient=2)
+      command.assert_awaited_with("g", "302", timeout=40)
+      await reader.stop_heating_or_cooling()
+      command.assert_awaited_with("g", "000", timeout=40)
     self.assertTrue(reader.supports_heating)
     self.assertFalse(reader.supports_active_cooling)
 
@@ -91,4 +115,28 @@ class TestCytationTemperature(unittest.IsolatedAsyncioTestCase):
       for target in (-1, 0, 65.01, float("nan"), float("inf")):
         with self.assertRaises(ValueError):
           await reader.set_temperature(target)
+      command.assert_not_awaited()
+
+  async def test_extended_temperature_fields(self):
+    reader = Cytation5("reader", use_cam=False)
+    with (
+      patch.object(reader, "query_capability", new_callable=AsyncMock) as capability,
+      patch.object(reader, "send_command", new_callable=AsyncMock) as command,
+    ):
+      capability.side_effect = lambda code: (
+        b"1" + b"0" * 16 if code == 2126 else b"1402" + b"0" * 13
+      )
+      await reader.set_temperature(30.5, gradient=1.2)
+      command.assert_awaited_with("g", "30512", timeout=40)
+
+  async def test_fractional_target_rejected_by_integer_firmware(self):
+    reader = Cytation5("reader", use_cam=False)
+    reader.io = MagicMock()
+    reader.io.stop = AsyncMock()
+    with (
+      patch.object(reader, "query_capability", new_callable=AsyncMock, return_value=b"0" * 17),
+      patch.object(reader, "send_command", new_callable=AsyncMock) as command,
+    ):
+      with self.assertRaisesRegex(ValueError, "steps of 1.0"):
+        await reader.set_temperature(30.5)
       command.assert_not_awaited()

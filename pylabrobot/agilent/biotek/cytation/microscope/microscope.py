@@ -31,6 +31,7 @@ from pylabrobot.agilent.biotek.cytation.microscope.models import (
 from pylabrobot.resources.plate import Plate
 
 from .aravis_camera import AravisCamera
+from .laser_autofocus import CytationLaserAutofocus
 from .configuration import (
   CytationObjectiveConfiguration,
   parse_focus_resolution,
@@ -39,7 +40,7 @@ from .configuration import (
 )
 
 if TYPE_CHECKING:
-  from pylabrobot.agilent.biotek.plate_reader_base import BioTekPlateReaderDriver
+  from pylabrobot.agilent.biotek.cytation.cytation5 import Cytation5
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ class CytationImagingConfig:
   camera_serial_number: Optional[str] = None
   filters: Optional[List[Optional[ImagingMode]]] = None
   objectives: Optional[List[Optional[Objective]]] = None
-  max_image_read_attempts: int = 50
+  max_image_read_attempts: int = 3
   image_read_delay: float = 0.3
   camera_pixel_size: Optional[float] = None
   optical_relay_magnification: float = 1.0
@@ -81,7 +82,7 @@ class CytationMicroscope:
 
   def __init__(
     self,
-    driver: BioTekPlateReaderDriver,
+    driver: Cytation5,
     camera_serial: Optional[str] = None,
     imaging_config: Optional[CytationImagingConfig] = None,
     use_cam: bool = True,
@@ -97,6 +98,8 @@ class CytationMicroscope:
     # Imaging state
     self._filters: Optional[List[Optional[ImagingMode]]] = self.imaging_config.filters
     self._objectives: Optional[List[Optional[Objective]]] = self.imaging_config.objectives
+    self._laser_slot: Optional[int] = None
+    self.laser = CytationLaserAutofocus(self)
     self._objective_configurations: List[Optional[CytationObjectiveConfiguration]] = []
     self._exposure: Optional[Exposure] = None
     self._focal_height: Optional[FocalPosition] = None
@@ -104,6 +107,7 @@ class CytationMicroscope:
     self._position_digits: Optional[int] = None
     self._gain: Optional[Gain] = None
     self._imaging_mode: Optional[ImagingMode] = None
+    self._led_intensity = 10
     self._row: Optional[int] = None
     self._column: Optional[int] = None
     self._pos_x: Optional[float] = None
@@ -114,6 +118,7 @@ class CytationMicroscope:
   async def _on_setup(self) -> None:
     """Connect camera (if use_cam) and load filters/objectives from firmware."""
     self._clear_imaging_state()
+    self.laser.calibration = None
     if self._use_cam:
       serial = self._camera_serial or (
         self.imaging_config.camera_serial_number if self.imaging_config else None
@@ -213,6 +218,7 @@ class CytationMicroscope:
     }
 
     self._filters = []
+    self._laser_slot = None
     for slot in range(1, 5):
       configuration = await self.driver.send_command("i", f"q{slot}")
       assert configuration is not None
@@ -221,6 +227,8 @@ class CytationMicroscope:
         self._filters.append(None)
       else:
         cytation_code = int(parts[0])
+        if cytation_code == 1225010:
+          self._laser_slot = slot
         self._filters.append(cytation_code2imaging_mode.get(cytation_code, None))
 
     logger.info("Loaded filters: %s", self._filters)
@@ -312,6 +320,40 @@ class CytationMicroscope:
           raise
     raise TimeoutError("max_image_read_attempts reached")
 
+  async def _set_color_brightfield_led(self, led_code: int, intensity: int) -> None:
+    """Switch color-brightfield illumination to a single LED color and strobe it.
+
+    Unlike other modes, color brightfield has no static LED state: the instrument turns on one of
+    the three LED colors (``i L0{led_code}{intensity}``), strobes it (``i l{led_code}``), then the
+    camera is triggered, repeating once per color. See ``COLOR_BRIGHTFIELD_LED_CODES``.
+    """
+    if not 1 <= intensity <= 10:
+      raise ValueError("intensity must be between 1 and 10")
+    intensity_str = str(intensity).zfill(2)
+    await self.driver.send_command("i", f"L0{led_code}{intensity_str}")
+    await self.driver.send_command("i", f"l{led_code}")
+
+  async def _acquire_color_brightfield_image(self, led_intensity: int) -> Image:
+    """Acquire one color-brightfield image.
+
+    Captures a mono frame under each of the three brightfield LED colors and stacks them into an
+    ``(H, W, 3)`` RGB image. A single exposure/gain (set by the caller) is used for all three
+    channels; Gen5's per-color auto-exposure is not replicated.
+    """
+    import numpy as np
+
+    channels: List[Image] = []
+    for led_code in COLOR_BRIGHTFIELD_LED_CODES:
+      await self._set_color_brightfield_led(led_code, intensity=led_intensity)
+      channels.append(await self.acquire_image())
+    return np.stack(channels, axis=-1)
+
+  async def _acquire_analysis_image(self) -> Image:
+    """Use the selected illumination, including all RGB channels, for automatic searches."""
+    if self._imaging_mode == ImagingMode.COLOR_BRIGHTFIELD:
+      return await self._acquire_color_brightfield_image(self._led_intensity)
+    return await self.acquire_image()
+
   async def auto_expose(self, settings: Optional[AutoExposure] = None) -> float:
     """Find and retain a bounded exposure, returning milliseconds.
 
@@ -329,7 +371,7 @@ class CytationMicroscope:
       async def evaluate(image: Image) -> Literal["higher", "lower", "good"]:
         """Avoid clipping the brightest structures without amplifying isolated hot pixels."""
         if image.dtype.kind != "u":
-          raise ValueError("Automatic exposure requires unsigned monochrome images")
+          raise ValueError("Automatic exposure requires unsigned images")
         level = float(np.percentile(image, 99)) / self.camera.get_pixel_max()
         return "higher" if level < 0.6 else "lower" if level > 0.8 else "good"
 
@@ -349,7 +391,7 @@ class CytationMicroscope:
         for _ in range(settings.max_rounds):
           exposure = math.sqrt(low) * math.sqrt(high)
           await self.set_exposure(exposure)
-          result = await settings.evaluate_exposure(await self.acquire_image())
+          result = await settings.evaluate_exposure(await self._acquire_analysis_image())
           if result == "good":
             return await self.get_exposure()
           if result == "higher":
@@ -393,7 +435,7 @@ class CytationMicroscope:
       if position in scores:
         return
       await self.set_focus(position)
-      score = float(settings.evaluate_focus(await self.acquire_image()))
+      score = float(settings.evaluate_focus(await self._acquire_analysis_image()))
       if not math.isfinite(score):
         raise ValueError("Focus evaluator returned a non-finite score")
       scores[position] = score
@@ -427,34 +469,6 @@ class CytationMicroscope:
         if not was_acquiring:
           self.stop_acquisition()
 
-  async def _set_color_brightfield_led(self, led_code: int, intensity: int) -> None:
-    """Switch color-brightfield illumination to a single LED color and strobe it.
-
-    Unlike other modes, color brightfield has no static LED state: the instrument turns on one of
-    the three LED colors (``i L0{led_code}{intensity}``), strobes it (``i l{led_code}``), then the
-    camera is triggered, repeating once per color. See ``COLOR_BRIGHTFIELD_LED_CODES``.
-    """
-    if not 1 <= intensity <= 10:
-      raise ValueError("intensity must be between 1 and 10")
-    intensity_str = str(intensity).zfill(2)
-    await self.driver.send_command("i", f"L0{led_code}{intensity_str}")
-    await self.driver.send_command("i", f"l{led_code}")
-
-  async def _acquire_color_brightfield_image(self, led_intensity: int) -> Image:
-    """Acquire one color-brightfield image.
-
-    Captures a mono frame under each of the three brightfield LED colors and stacks them into an
-    ``(H, W, 3)`` RGB image. A single exposure/gain (set by the caller) is used for all three
-    channels; Gen5's per-color auto-exposure is not replicated.
-    """
-    import numpy as np
-
-    channels: List[Image] = []
-    for led_code in COLOR_BRIGHTFIELD_LED_CODES:
-      await self._set_color_brightfield_led(led_code, intensity=led_intensity)
-      channels.append(await self.acquire_image())
-    return np.stack(channels, axis=-1)
-
   async def get_exposure(self) -> float:
     """Get current exposure time in ms."""
     return await self.camera.get_exposure()
@@ -485,7 +499,10 @@ class CytationMicroscope:
 
   async def set_imaging_mode(self, mode: ImagingMode, led_intensity: int = 10) -> None:
     """Set filter wheel position and LED."""
+    if not isinstance(led_intensity, int) or not 1 <= led_intensity <= 10:
+      raise ValueError("led_intensity must be an integer between 1 and 10")
     async with self.driver._operation():
+      self._led_intensity = led_intensity
       if mode == self._imaging_mode:
         # Color brightfield has no single LED state to (re)enable; its colors are cycled per frame
         # during acquisition (see _acquire_color_brightfield_image).
@@ -532,7 +549,8 @@ class CytationMicroscope:
   async def set_focus(self, focal_position: FocalPosition) -> None:
     """Move focus motor to the specified height (mm)."""
     if focal_position == "machine-auto":
-      raise ValueError("focal_position cannot be 'machine-auto'. Use PLR's auto-focus instead.")
+      await self.laser.autofocus()
+      return
 
     position = float(focal_position)
     if not math.isfinite(position) or position < 0:
@@ -753,7 +771,7 @@ class CytationMicroscope:
     )
 
     async with self.driver._operation():
-      await self.driver.set_plate(plate)
+      await self.driver._prepare_microscopy(plate)
 
       if not self._acquiring:
         self.start_acquisition()

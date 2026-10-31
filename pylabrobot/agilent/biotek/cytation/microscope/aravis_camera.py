@@ -10,7 +10,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 try:
   import numpy as np
@@ -97,6 +97,7 @@ class AravisCamera:
     self._width: int = 0
     self._height: int = 0
     self._payload_size: int = 0
+    self._pixel_byte_order: Literal["<", ">"] = "<"
     self._capture_lock = asyncio.Lock()
 
   @property
@@ -151,7 +152,7 @@ class AravisCamera:
         "  macOS:   brew install aravis && pip install PyGObject\n"
         "  Linux:   sudo apt-get install libaravis-dev gobject-introspection "
         "&& pip install PyGObject\n"
-        "  Windows: pacman -S mingw-w64-x86_64-aravis (in MSYS2)"
+        "  Windows: pacman -S mingw-w64-ucrt-x86_64-aravis (in MSYS2 UCRT64)"
       )
 
     self._serial_number = serial_number
@@ -189,6 +190,17 @@ class AravisCamera:
       ) from e
 
     self._device = self.camera.get_device()
+    if self.device.is_feature_available("PixelBigEndian"):
+      self._pixel_byte_order = (
+        ">" if self.device.get_boolean_feature_value("PixelBigEndian") else "<"
+      )
+    else:
+      # The GS3-U3-14S5M's older XML omits PixelBigEndian while its Mono16
+      # stream is big endian. Other USB3 Vision cameras use little endian.
+      model = self.device.get_string_feature_value("DeviceModelName")
+      self._pixel_byte_order = (
+        ">" if model in ("GS3-U3-14S5M", "Grasshopper3 GS3-U3-14S5M") else "<"
+      )
 
     # Aravis disables other trigger selectors and configures the appropriate edge
     # and frame-rate settings for the camera model.
@@ -292,7 +304,7 @@ class AravisCamera:
         }
         if pixel_format not in formats:
           raise NotImplementedError(f"Unsupported camera pixel format: 0x{pixel_format:08x}")
-        dtype = np.dtype(formats[pixel_format])
+        dtype = np.dtype(formats[pixel_format]).newbyteorder(self._pixel_byte_order)
         width, height = buffer.get_image_width(), buffer.get_image_height()
         padding_x, _ = buffer.get_image_padding()
         stride = width * dtype.itemsize + padding_x
@@ -301,7 +313,7 @@ class AravisCamera:
           raise RuntimeError("Camera image payload is shorter than its dimensions")
         return np.ndarray(
           (height, width), dtype=dtype, buffer=data, strides=(stride, dtype.itemsize)
-        ).copy()
+        ).astype(dtype.newbyteorder("="), copy=True)
       finally:
         stream.push_buffer(buffer)
 
@@ -483,7 +495,7 @@ class AravisCamera:
         "  macOS:   brew install aravis && pip install PyGObject\n"
         "  Linux:   sudo apt-get install libaravis-dev gobject-introspection "
         "&& pip install PyGObject\n"
-        "  Windows: pacman -S mingw-w64-x86_64-aravis (in MSYS2)"
+        "  Windows: pacman -S mingw-w64-ucrt-x86_64-aravis (in MSYS2 UCRT64)"
       )
 
     Aravis.update_device_list()

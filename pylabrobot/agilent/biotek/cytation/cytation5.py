@@ -33,6 +33,7 @@ class Cytation5(_CytationBase):
   ):
     super().__init__(name=name, device_id=device_id, port=port)
 
+    self._tray_closed = False
     self.microscope = CytationMicroscope(
       driver=self,
       camera_serial=camera_serial,
@@ -50,20 +51,52 @@ class Cytation5(_CytationBase):
     """Heating reaches 65 °C; the lowest regulated temperature depends on ambient."""
     return None, 65.0
 
-  async def set_temperature(self, temperature: float) -> Optional[bytes]:
-    """Set the incubation target in °C, up to 65 °C.
+  async def _temperature_parameters(self, temperature: float, gradient: float) -> str:
+    """Encode firmware-selected temperature and top/bottom gradient fields."""
+    tenths = (await self.query_capability(2126))[:1] == b"1"
+    gradient_capability = await self.query_capability(2088)
+    has_gradient = gradient_capability[:1] == b"1"
+    resolution = 0.1 if tenths else 1.0
+    values = (temperature, gradient)
+    if any(not math.isclose(value / resolution, round(value / resolution)) for value in values):
+      raise ValueError(f"This firmware requires temperature and gradient steps of {resolution} °C")
+    parameters = f"{round(temperature / resolution):0{3 if tenths else 2}d}"
+    if has_gradient:
+      limit_field = gradient_capability[1:2]
+      if not limit_field.isdigit():
+        raise ValueError(f"Malformed temperature-gradient capability: {gradient_capability!r}")
+      limit = int(limit_field) or 3
+      if not 0 <= gradient <= limit:
+        raise ValueError(f"Temperature gradient must be between 0 and {limit} °C")
+      parameters += f"{round(gradient / resolution):0{2 if tenths else 1}d}"
+    elif gradient != 0:
+      raise ValueError("This firmware does not support a temperature gradient")
+    return parameters
 
-    Regulation is specified from ambient + 4 °C. Lowering the target allows
-    passive cooling; this instrument does not have active cooling. Use
-    ``stop_heating_or_cooling()`` to disable the heater.
+  async def set_temperature(self, temperature: float, gradient: float = 0) -> Optional[bytes]:
+    """Set incubation in °C, with an optional top/bottom temperature gradient.
+
+    Regulation is specified from ambient + 4 °C to 65 °C. Lowering the target
+    allows passive cooling. Firmware determines the supported resolution and
+    gradient range. This acknowledges the target without waiting for equilibrium.
     """
     if not math.isfinite(temperature) or not 0 < temperature <= 65:
       raise ValueError("Cytation 5 temperature must be finite and in (0, 65] °C")
-    return await self.send_command("g", f"{round(temperature * 1000):05d}")
+    if not math.isfinite(gradient) or gradient < 0:
+      raise ValueError("Temperature gradient must be finite and nonnegative")
+    async with self._operation():
+      parameters = await self._temperature_parameters(temperature, gradient)
+      return await self.send_command("g", parameters, timeout=40)
+
+  async def stop_heating_or_cooling(self) -> Optional[bytes]:
+    """Disable incubation using this firmware's temperature field lengths."""
+    async with self._operation():
+      return await self.send_command("g", await self._temperature_parameters(0, 0), timeout=40)
 
   def _reset_state(self) -> None:
     """Discard optics and plate position assumptions after disconnecting."""
     super()._reset_state()
+    self._tray_closed = False
     self.microscope._clear_imaging_state()
 
   async def setup(self) -> None:
@@ -90,17 +123,27 @@ class Cytation5(_CytationBase):
       finally:
         await super().stop()
 
+  async def _prepare_plate_read(self) -> None:
+    """Disable microscopy illumination and forget stage positions before an assay."""
+    self._tray_closed = False
+    await self.microscope.led_off()
+    self.microscope.stop_acquisition()
+    self.microscope._clear_imaging_state()
+
   async def open(self, slow: bool = False) -> None:
     """Extend the loading tray and invalidate the microscope's sample position."""
     async with self._operation():
       await self.microscope.led_off()
       await super().open(slow=slow)
+      self._tray_closed = False
+      self.microscope.laser.calibration = None
       self.microscope._clear_sample_position()
 
   async def close(self, plate: Optional[Plate] = None, slow: bool = False) -> None:
     """Retract the tray using the supplied plate geometry."""
     async with self._operation():
       await super().close(plate=plate, slow=slow)
+      self._tray_closed = True
       self.microscope._clear_sample_position()
 
   async def set_plate(self, plate: Plate) -> Optional[bytes]:
@@ -124,4 +167,23 @@ class Cytation5(_CytationBase):
         await self.close()
         self._plate = plate
       self.microscope._clear_sample_position()
+      self.microscope.laser.calibration = None
+      return response
+
+  async def _prepare_microscopy(self, plate: Plate) -> None:
+    """Retract the tray before imaging when its state is unknown or an assay has run."""
+    async with self._operation():
+      if not self._tray_closed:
+        await self.close(plate=plate)
+      else:
+        await self.set_plate(plate)
+
+  async def home(self) -> Optional[bytes]:
+    """Home the imager axes and extend the carrier; reclose before microscopy."""
+    async with self._operation():
+      await self.microscope.led_off()
+      response = await super().home()
+      self._tray_closed = False
+      self.microscope.laser.calibration = None
+      self.microscope._clear_imaging_state()
       return response

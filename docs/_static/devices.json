@@ -85,11 +85,13 @@
       "absorbance",
       "fluorescence",
       "luminescence",
-      "microscopy"
+      "microscopy",
+      "heating"
     ],
     "status": "full",
     "api": "pylabrobot.agilent.biotek.cytation.Cytation5",
     "api_version": "v1",
+    "doc_slug": "agilent/cytation5/hello-world",
     "code_slug": "agilent/biotek/cytation",
     "manager": "https://discuss.pylabrobot.org/u/rickwierenga",
     "oem": "https://www.agilent.com/en/product/cell-analysis/cell-imaging-microscopy/cell-imaging-multimode-readers/biotek-cytation-5-cell-imaging-multimode-reader-1623202"

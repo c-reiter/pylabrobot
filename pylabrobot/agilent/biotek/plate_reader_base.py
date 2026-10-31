@@ -5,7 +5,7 @@ from abc import ABCMeta
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from pylabrobot.agilent.biotek._reader import _BioTekReader
+from pylabrobot.agilent.biotek._reader import BioTekHandshakeError, _BioTekReader
 from pylabrobot.agilent.biotek.plate_reader_protocol import (
   encode_absorbance,
   parse_assay_response,
@@ -85,7 +85,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     """Identify the reader, retrying at the alternate supported baud rate."""
     try:
       await super()._initialize_reader()
-    except TimeoutError:
+    except (TimeoutError, BioTekHandshakeError):
       if isinstance(self.io, Serial):
         await self.io.stop()
         self.io.baudrate = 38_461
@@ -192,7 +192,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         await self.set_plate(plate)
       await super().close()
 
-  async def home(self):
+  async def home(self) -> Optional[bytes]:
+    """Home the reader axes through the imager-controller command."""
     return await self.send_command("i", "x")
 
   async def set_temperature(self, temperature: float):
@@ -310,6 +311,9 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       await self._disconnect()
       return None
 
+  async def _prepare_plate_read(self) -> None:
+    """Allow an integrated microscope to release optics before a plate-reader assay."""
+
   async def read_absorbance(
     self,
     plate: Plate,
@@ -339,6 +343,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         len(wells),
       )
       await self.set_plate(plate)
+      await self._prepare_plate_read()
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
@@ -404,6 +409,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         len(wells),
       )
       await self.set_plate(plate)
+      await self._prepare_plate_read()
 
       cmd = f"3{14220 + int(1000 * focal_height)}\x03"
       await self.send_command("t", cmd)
@@ -482,6 +488,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         len(wells),
       )
       await self.set_plate(plate)
+      await self._prepare_plate_read()
 
       cmd = f"{614220 + int(1000 * focal_height)}\x03"
       await self.send_command("t", cmd)
@@ -525,53 +532,58 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       ]
 
   async def _abort(self) -> None:
+    """Abort an active cycle and consume its DLE/status completion frame."""
     await self.send_command("x", wait_for_response=False)
+    response = await self._read_until(b"\x03", timeout=30)
+    if len(response) != 6 or response[:1] != b"\x10":
+      raise ValueError(f"BioTek abort: expected DLE and status, received {response!r}")
+    self._check_status(response[-5:])
 
   class ShakeType(enum.IntEnum):
     LINEAR = 0
     ORBITAL = 1
 
+  async def _start_shaking_cycle(self, shake_type: ShakeType, frequency: int) -> None:
+    """Start one firmware-limited sixteen-minute shaking cycle."""
+    async with self._operation():
+      await self._prepare_plate_read()
+      cmd = f"0033010101010100002000000013960{shake_type.value}{frequency}01"
+      checksum = (sum(cmd.encode()) + 73) % 100
+      parse_response(await self.send_command("D", f"{cmd}{checksum:02d}\x03"), "D")
+      response = await self.send_command("O")
+      parse_response(response, "O")
+      if response != b"\x060000\x03":
+        raise ValueError(f"BioTek O: expected ACK and status, received {response!r}")
+
   async def shake(self, shake_type: ShakeType, frequency: int) -> None:
-    """Start continuous shaking.
+    """Start continuous shaking, reporting startup errors to the caller.
 
     Args:
-      frequency: speed, in mm. 360 CPM = 6mm; 410 CPM = 5mm; 493 CPM = 4mm;
-        567 CPM = 3mm; 731 CPM = 2mm; 1096 CPM = 1mm
+      shake_type: Linear or orbital shaking.
+      frequency: Speed setting: 6 = 360 CPM, 5 = 410 CPM, 4 = 493 CPM,
+        3 = 567 CPM, 2 = 731 CPM, 1 = 1096 CPM.
     """
+    if not isinstance(shake_type, self.ShakeType):
+      raise ValueError("shake_type must be a ShakeType")
+    if isinstance(frequency, bool) or not isinstance(frequency, int) or not 1 <= frequency <= 6:
+      raise ValueError("Frequency must be an integer between 1 and 6")
 
-    max_duration = 16 * 60
-    self._shaking_started = asyncio.Event()
+    async def renew_shaking() -> None:
+      """Renew the firmware cycle until stopped, logging later connection failures."""
+      try:
+        while self._shaking:
+          await asyncio.sleep(16 * 60)
+          if self._shaking:
+            await self._start_shaking_cycle(shake_type, frequency)
+      except Exception:
+        self._shaking = False
+        logger.exception("Continuous shaking stopped after a reader error")
 
-    async def shake_maximal_duration():
-      async with self._operation():
-        shake_type_bit = str(shake_type.value)
-        duration = str(max_duration).zfill(3)
-        assert 1 <= frequency <= 6, "Frequency must be between 1 and 6"
-        cmd = f"0033010101010100002000000013{duration}{shake_type_bit}{frequency}01"
-        checksum = str((sum(cmd.encode()) + 73) % 100).zfill(2)
-        cmd = cmd + checksum + "\x03"
-        await self.send_command("D", cmd)
-
-        resp = await self.send_command("O")
-        assert resp == b"\x060000\x03"
-
-        if not self._shaking_started.is_set():
-          self._shaking_started.set()
-
-    async def shake_continuous():
-      while self._shaking:
-        await shake_maximal_duration()
-
-        seconds_since_start: float = 0
-        loop_wait_time = 0.25
-        while seconds_since_start < max_duration and self._shaking:
-          seconds_since_start += loop_wait_time
-          await asyncio.sleep(loop_wait_time)
-
-    self._shaking = True
-    self._shaking_task = asyncio.create_task(shake_continuous())
-
-    await self._shaking_started.wait()
+    async with self._operation():
+      await self.stop_shaking()
+      await self._start_shaking_cycle(shake_type, frequency)
+      self._shaking = True
+      self._shaking_task = asyncio.create_task(renew_shaking())
 
   async def stop_shaking(self) -> None:
     """Abort shaking and release the background task under the shared connection lock."""

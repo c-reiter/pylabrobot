@@ -12,6 +12,10 @@ from pylabrobot.io.serial import Serial
 logger = logging.getLogger(__name__)
 
 
+class BioTekHandshakeError(RuntimeError):
+  """A response lacks the command acknowledgement, possibly due to a baud mismatch."""
+
+
 class BioTekError(RuntimeError):
   """A complete instrument response containing a nonzero firmware status."""
 
@@ -193,7 +197,7 @@ class _BioTekReader:
       return None
     ack = await self._read_exactly(1)
     if ack != b"\x06":
-      raise RuntimeError(f"BioTek {command!r}: expected ACK, received {ack!r}")
+      raise BioTekHandshakeError(f"BioTek {command!r}: expected ACK, received {ack!r}")
     if parameters is not None:
       await self._write(parameters)
     if not wait_for_response:

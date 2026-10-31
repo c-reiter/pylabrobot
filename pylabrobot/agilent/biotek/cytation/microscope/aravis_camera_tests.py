@@ -74,3 +74,14 @@ class TestAravisFrames(unittest.IsolatedAsyncioTestCase):
     with self.assertRaisesRegex(RuntimeError, "Stop acquisition"):
       await self.driver.set_pixel_format(0x01100007)
     self.driver.camera.set_pixel_format.assert_not_called()
+
+  async def test_grasshopper_big_endian_mono16_is_native_uint16(self) -> None:
+    """Grasshopper frames must preserve intensities, not exchange their high and low bytes."""
+    self.driver._pixel_byte_order = ">"
+    self.buffer.get_image_pixel_format.return_value = 0x01100007
+    self.buffer.get_image_data.return_value = np.array(
+      [16, 1776, 3792, 65520], dtype=">u2"
+    ).tobytes()
+    frame = await self.driver.trigger()
+    np.testing.assert_array_equal(frame, [[16, 1776], [3792, 65520]])
+    self.assertEqual(frame.dtype, np.uint16)

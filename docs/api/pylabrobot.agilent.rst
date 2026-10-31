@@ -73,6 +73,22 @@ BioTek Cytation
     CytationImagingConfig
 
 
+.. currentmodule:: pylabrobot.agilent.biotek.cytation.microscope
+
+.. autosummary::
+  :toctree: _autosummary
+  :nosignatures:
+
+    CytationMicroscope
+    CytationLaserAutofocus
+    LaserFocusCalibration
+    Objective
+    ImagingMode
+    AutoFocus
+    AutoExposure
+    ImagingResult
+
+
 BioTek Synergy H1
 ------------------
 
