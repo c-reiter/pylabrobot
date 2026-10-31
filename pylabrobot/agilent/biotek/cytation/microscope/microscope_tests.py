@@ -1,5 +1,6 @@
 import unittest
 import unittest.mock
+from typing import Any
 
 import pytest
 
@@ -285,3 +286,64 @@ class TestAutomaticImaging(unittest.IsolatedAsyncioTestCase):
       with self.assertRaises(RuntimeError):
         await backend.autofocus(AutoFocus(evaluate, 10, 4, 5))
       self.assertFalse(backend._acquiring)
+
+
+class TestMontage(unittest.IsolatedAsyncioTestCase):
+  """Use rectangular camera dimensions and overlap for stage tiling."""
+
+  def test_grasshopper_field_of_view(self):
+    backend, _ = _make_backend()
+    backend.camera = unittest.mock.MagicMock()
+    backend.camera.width, backend.camera.height = 1384, 1036
+    backend.camera.get_device_info.return_value.model_name = "Grasshopper3 GS3-U3-14S5M"
+    width, height = backend.get_field_of_view(Objective.O_4X_PL_FL_Phase)
+    self.assertAlmostEqual(width, 2.2317)
+    self.assertAlmostEqual(height, 1.67055)
+
+  def test_full_coverage_uses_rows_for_height_and_columns_for_width(self):
+    grid, positions = CytationMicroscope._tile_positions("full", (6, 4), (2, 1), (0, 0), 0.25)
+    self.assertEqual(grid, (5, 4))
+    self.assertEqual(len(positions), 20)
+    self.assertEqual(positions[0], (-2.25, 1.5))
+    self.assertEqual(positions[-1], (2.25, -1.5))
+
+  def test_invalid_overlap_and_coverage_are_rejected(self):
+    for overlap in (-0.1, 1, float("nan")):
+      with self.assertRaises(ValueError):
+        CytationMicroscope._tile_positions((1, 2), (6, 6), (2, 1), (0, 0), overlap)
+    invalid_coverages: Any = ((0, 1), (1, 2.5), (-1, 2))
+    for coverage in invalid_coverages:
+      with self.assertRaises(ValueError):
+        CytationMicroscope._tile_positions(coverage, (6, 6), (2, 1), (0, 0), 0)
+
+  async def test_capture_returns_grid_and_stops_illumination(self):
+    from pylabrobot.resources import cor_96_wellplate_360uL_Fb
+
+    backend, driver = _make_backend()
+    driver.set_plate = unittest.mock.AsyncMock()
+    backend._objectives = [Objective.O_4X_PL_FL_Phase]
+    backend.camera = unittest.mock.MagicMock()
+    backend.camera.width, backend.camera.height = 1384, 1036
+    backend.camera.get_device_info.return_value.model_name = "Grasshopper3 GS3-U3-14S5M"
+    backend.camera.set_auto_exposure = unittest.mock.AsyncMock()
+    backend.camera.set_exposure = unittest.mock.AsyncMock()
+    backend.camera.set_gain = unittest.mock.AsyncMock()
+    backend.camera.get_exposure = unittest.mock.AsyncMock(return_value=10)
+    backend.camera.trigger = unittest.mock.AsyncMock(return_value=np.ones((5, 5), dtype=np.uint8))
+    result = await backend.capture(
+      1,
+      1,
+      ImagingMode.BRIGHTFIELD,
+      Objective.O_4X_PL_FL_Phase,
+      10,
+      3.28,
+      0,
+      cor_96_wellplate_360uL_Fb("plate"),
+      coverage=(1, 2),
+      overlap=0.2,
+    )
+    self.assertEqual(result.tile_grid, (1, 2))
+    self.assertEqual(len(result.images), 2)
+    self.assertEqual(len(result.tile_positions), 2)
+    driver.send_command.assert_awaited_with("i", "L0001")
+    backend.camera.stop_acquisition.assert_called_once()

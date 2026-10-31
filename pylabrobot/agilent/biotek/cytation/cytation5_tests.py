@@ -68,3 +68,27 @@ class TestCytationLifecycle(unittest.IsolatedAsyncioTestCase):
         await reader.setup()
       stop.assert_awaited_once()
     camera_stop.assert_awaited_once()
+
+
+class TestCytationTemperature(unittest.IsolatedAsyncioTestCase):
+  """Heater targets can be reduced without requiring active cooling."""
+
+  async def test_heating_range_and_passive_cooling(self):
+    reader = Cytation5("reader", use_cam=False)
+    with patch.object(reader, "send_command", new_callable=AsyncMock) as command:
+      await reader.set_temperature(37)
+      command.assert_awaited_with("g", "37000")
+      await reader.set_temperature(25)
+      command.assert_awaited_with("g", "25000")
+      await reader.set_temperature(65)
+      command.assert_awaited_with("g", "65000")
+    self.assertTrue(reader.supports_heating)
+    self.assertFalse(reader.supports_active_cooling)
+
+  async def test_invalid_targets_do_not_send_commands(self):
+    reader = Cytation5("reader", use_cam=False)
+    with patch.object(reader, "send_command", new_callable=AsyncMock) as command:
+      for target in (-1, 0, 65.01, float("nan"), float("inf")):
+        with self.assertRaises(ValueError):
+          await reader.set_temperature(target)
+      command.assert_not_awaited()

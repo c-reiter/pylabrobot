@@ -1,7 +1,7 @@
 import enum
 import sys
 from dataclasses import dataclass
-from typing import Awaitable, Callable, List, Literal, Union
+from typing import Awaitable, Callable, List, Literal, Optional, Tuple, Union
 
 if sys.version_info >= (3, 10):
   from typing import TypeAlias
@@ -128,3 +128,5 @@ class ImagingResult:
   images: List[Image]
   exposure_time: float
   focal_height: float
+  tile_positions: Optional[List[Tuple[float, float]]] = None
+  tile_grid: Optional[Tuple[int, int]] = None

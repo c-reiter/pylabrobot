@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import math
+from typing import Optional, Tuple
 
 from pylabrobot.agilent.biotek._reader import BioTekError
 from pylabrobot.resources import Plate
@@ -38,6 +39,27 @@ class Cytation5(_CytationBase):
       imaging_config=imaging_config,
       use_cam=use_cam,
     )
+
+  @property
+  def supports_heating(self) -> bool:
+    """The Cytation 5 has an incubation heater."""
+    return True
+
+  @property
+  def temperature_range(self) -> Tuple[Optional[float], Optional[float]]:
+    """Heating reaches 65 °C; the lowest regulated temperature depends on ambient."""
+    return None, 65.0
+
+  async def set_temperature(self, temperature: float) -> Optional[bytes]:
+    """Set the incubation target in °C, up to 65 °C.
+
+    Regulation is specified from ambient + 4 °C. Lowering the target allows
+    passive cooling; this instrument does not have active cooling. Use
+    ``stop_heating_or_cooling()`` to disable the heater.
+    """
+    if not math.isfinite(temperature) or not 0 < temperature <= 65:
+      raise ValueError("Cytation 5 temperature must be finite and in (0, 65] °C")
+    return await self.send_command("g", f"{round(temperature * 1000):05d}")
 
   def _reset_state(self) -> None:
     """Discard optics and plate position assumptions after disconnecting."""

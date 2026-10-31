@@ -55,13 +55,21 @@ COLOR_BRIGHTFIELD_LED_CODES = (6, 7, 8)
 
 @dataclass
 class CytationImagingConfig:
-  """Imaging configuration for the Cytation."""
+  """Imaging configuration for the Cytation.
+
+  ``camera_pixel_size`` is sensor pixel pitch in mm. When omitted, use the known
+  camera model's nominal pitch. ``optical_relay_magnification`` accounts for any
+  relay optics between objective and camera; the standard Cytation path is 1×.
+  Supply a measured effective pitch for quantitative montage calibration.
+  """
 
   camera_serial_number: Optional[str] = None
   filters: Optional[List[Optional[ImagingMode]]] = None
   objectives: Optional[List[Optional[Objective]]] = None
   max_image_read_attempts: int = 50
   image_read_delay: float = 0.3
+  camera_pixel_size: Optional[float] = None
+  optical_relay_magnification: float = 1.0
 
 
 class CytationMicroscope:
@@ -246,30 +254,32 @@ class CytationMicroscope:
 
   async def set_exposure(self, exposure: Exposure) -> None:
     """Set camera exposure time in ms."""
-    if exposure == self._exposure:
-      return
-
-    if isinstance(exposure, str):
-      if exposure == "machine-auto":
-        await self.camera.set_auto_exposure("continuous")
-        self._exposure = "machine-auto"
+    async with self.driver._operation():
+      if exposure == self._exposure:
         return
-      raise ValueError("exposure must be a number or 'machine-auto'")
-    await self.camera.set_auto_exposure("off")
-    await self.camera.set_exposure(float(exposure))
-    self._exposure = exposure
+
+      if isinstance(exposure, str):
+        if exposure == "machine-auto":
+          await self.camera.set_auto_exposure("continuous")
+          self._exposure = "machine-auto"
+          return
+        raise ValueError("exposure must be a number or 'machine-auto'")
+      await self.camera.set_auto_exposure("off")
+      await self.camera.set_exposure(float(exposure))
+      self._exposure = exposure
 
   async def set_gain(self, gain: Gain) -> None:
     """Set camera gain."""
-    if gain == self._gain:
-      return
+    async with self.driver._operation():
+      if gain == self._gain:
+        return
 
-    if gain == "machine-auto":
-      await self.camera.set_auto_gain("continuous")
-    else:
-      await self.camera.set_gain(float(gain))
+      if gain == "machine-auto":
+        await self.camera.set_auto_gain("continuous")
+      else:
+        await self.camera.set_gain(float(gain))
 
-    self._gain = gain
+      self._gain = gain
 
   async def set_auto_exposure(self, auto_exposure: Literal["off", "once", "continuous"]) -> None:
     """Set camera auto-exposure mode."""
@@ -475,47 +485,49 @@ class CytationMicroscope:
 
   async def set_imaging_mode(self, mode: ImagingMode, led_intensity: int = 10) -> None:
     """Set filter wheel position and LED."""
-    if mode == self._imaging_mode:
-      # Color brightfield has no single LED state to (re)enable; its colors are cycled per frame
-      # during acquisition (see _acquire_color_brightfield_image).
+    async with self.driver._operation():
+      if mode == self._imaging_mode:
+        # Color brightfield has no single LED state to (re)enable; its colors are cycled per frame
+        # during acquisition (see _acquire_color_brightfield_image).
+        if mode != ImagingMode.COLOR_BRIGHTFIELD:
+          await self.led_on(intensity=led_intensity)
+        return
+
+      await self.led_off()
+      filter_index = self._imaging_mode_code(mode)
+
+      if mode == ImagingMode.PHASE_CONTRAST:
+        # Position 20 selects the configured annulus for the current objective.
+        await self.driver.send_command("Y", "P1120")
+        await self.driver.send_command("Y", "P0d05")
+        await self.driver.send_command("Y", "P1002")
+      elif mode in (ImagingMode.BRIGHTFIELD, ImagingMode.COLOR_BRIGHTFIELD):
+        await self.driver.send_command("Y", "P1101")
+        await self.driver.send_command("Y", "P0d05")
+        await self.driver.send_command("Y", "P1002")
+      else:
+        await self.driver.send_command("Y", "P1101")
+        await self.driver.send_command("Y", f"P0d{filter_index:02}")
+        await self.driver.send_command("Y", "P1001")
+
+      # Color brightfield has no single LED state; its colors are cycled per frame during
+      # acquisition (see _acquire_color_brightfield_image).
+      self._imaging_mode = mode
+      self._focal_height = None
       if mode != ImagingMode.COLOR_BRIGHTFIELD:
         await self.led_on(intensity=led_intensity)
-      return
-
-    await self.led_off()
-    filter_index = self._imaging_mode_code(mode)
-
-    if mode == ImagingMode.PHASE_CONTRAST:
-      # Position 20 selects the configured annulus for the current objective.
-      await self.driver.send_command("Y", "P1120")
-      await self.driver.send_command("Y", "P0d05")
-      await self.driver.send_command("Y", "P1002")
-    elif mode in (ImagingMode.BRIGHTFIELD, ImagingMode.COLOR_BRIGHTFIELD):
-      await self.driver.send_command("Y", "P1101")
-      await self.driver.send_command("Y", "P0d05")
-      await self.driver.send_command("Y", "P1002")
-    else:
-      await self.driver.send_command("Y", "P1101")
-      await self.driver.send_command("Y", f"P0d{filter_index:02}")
-      await self.driver.send_command("Y", "P1001")
-
-    # Color brightfield has no single LED state; its colors are cycled per frame during
-    # acquisition (see _acquire_color_brightfield_image).
-    self._imaging_mode = mode
-    self._focal_height = None
-    if mode != ImagingMode.COLOR_BRIGHTFIELD:
-      await self.led_on(intensity=led_intensity)
 
   async def set_objective(self, objective: Objective) -> None:
     """Rotate objective turret to the specified objective."""
-    if objective == self._objective:
-      return
-    obj_code = self._objective_code(objective)
-    await self.driver.send_command("Y", f"P0e{obj_code:02}", timeout=60)
-    self._objective = objective
-    self._imaging_mode = None  # force re-set after objective change
-    self._focal_height = None
-    self._pos_x, self._pos_y = None, None
+    async with self.driver._operation():
+      if objective == self._objective:
+        return
+      obj_code = self._objective_code(objective)
+      await self.driver.send_command("Y", f"P0e{obj_code:02}", timeout=60)
+      self._objective = objective
+      self._imaging_mode = None  # force re-set after objective change
+      self._focal_height = None
+      self._pos_x, self._pos_y = None, None
 
   async def set_focus(self, focal_position: FocalPosition) -> None:
     """Move focus motor to the specified height (mm)."""
@@ -645,6 +657,59 @@ class CytationMicroscope:
       raise ValueError(f"Malformed focus calibration response: {response!r}")
     return int(response[1:-5]) * self.focus_resolution if response[:1] == b"1" else None
 
+  def get_field_of_view(self, objective: Objective) -> Tuple[float, float]:
+    """Return image width and height in mm using camera dimensions and optical scale.
+
+    The Grasshopper GS3-U3-14S5M has 6.45 µm sensor pixels. Other cameras require
+    ``camera_pixel_size`` in the imaging configuration. Calibration takes precedence
+    over nominal sensor pitch. The camera must be connected to read its image size.
+    """
+    pitch = self.imaging_config.camera_pixel_size
+    relay = self.imaging_config.optical_relay_magnification
+    if pitch is None:
+      model = self.camera.get_device_info().model_name.removeprefix("Grasshopper3 ")
+      pitches = {"GS3-U3-14S5M": 0.00645, "GS3-U3-14S5M-C": 0.00645}
+      if model not in pitches:
+        raise ValueError(f"Set camera_pixel_size to calibrate the field of view of {model}")
+      pitch = pitches[model]
+    if not math.isfinite(pitch) or pitch <= 0 or not math.isfinite(relay) or relay <= 0:
+      raise ValueError("Pixel size and optical relay magnification must be finite and positive")
+    scale = pitch / (objective.magnification * relay)
+    if self.camera.width <= 0 or self.camera.height <= 0:
+      raise RuntimeError("Connect the camera before calculating its field of view")
+    return self.camera.width * scale, self.camera.height * scale
+
+  @staticmethod
+  def _tile_positions(
+    coverage: Union[Literal["full"], Tuple[int, int]],
+    well_size: Tuple[float, float],
+    field_of_view: Tuple[float, float],
+    center: Tuple[float, float],
+    overlap: float,
+  ) -> Tuple[Tuple[int, int], List[Tuple[float, float]]]:
+    """Plan a centered row-major tile grid, retaining the camera's aspect ratio."""
+    width, height = field_of_view
+    if not all(math.isfinite(v) and v > 0 for v in (width, height, *well_size)):
+      raise ValueError("Field of view and well dimensions must be finite and positive")
+    if not math.isfinite(overlap) or not 0 <= overlap < 1:
+      raise ValueError("overlap must be finite and in [0, 1)")
+    if not all(math.isfinite(v) for v in center):
+      raise ValueError("Capture center coordinates must be finite")
+    dx, dy = width * (1 - overlap), height * (1 - overlap)
+    if coverage == "full":
+      rows = max(1, math.ceil((well_size[1] - height) / dy) + 1)
+      cols = max(1, math.ceil((well_size[0] - width) / dx) + 1)
+    else:
+      rows, cols = coverage
+      if not isinstance(rows, int) or not isinstance(cols, int) or rows < 1 or cols < 1:
+        raise ValueError("coverage must specify positive integer rows and columns")
+    positions = [
+      (center[0] + (column - (cols - 1) / 2) * dx, center[1] - (row - (rows - 1) / 2) * dy)
+      for row in range(rows)
+      for column in range(cols)
+    ]
+    return (rows, cols), positions
+
   async def capture(
     self,
     row: int,
@@ -669,92 +734,79 @@ class CytationMicroscope:
         ``(rows, cols)`` tuple for a specific tile grid. ``(1, 1)`` is a single image.
       center_position: Center position of the capture area as ``(x_mm, y_mm)`` relative
         to the well center. If None, centers on the well.
-      overlap: Fractional overlap between tiles (0.0-1.0) for montage stitching.
+      overlap: Fractional overlap between tiles (0 <= overlap < 1) for montage stitching.
         If None, no overlap. Only used when coverage produces multiple tiles.
       auto_stop_acquisition: Whether to automatically stop image acquisition after capture.
     """
-    if overlap is not None:
-      raise NotImplementedError("overlap is not implemented yet")
+    if not 1 <= row <= plate.num_items_y or not 1 <= column <= plate.num_items_x:
+      raise ValueError("Capture row and column must identify a well on the supplied plate")
+    center = center_position if center_position is not None else (0.0, 0.0)
+    first_well = plate.get_item(0)
+    # A single frame needs no physical-scale calibration.
+    field_of_view = (1.0, 1.0) if coverage == (1, 1) else self.get_field_of_view(objective)
+    grid, positions = self._tile_positions(
+      coverage,
+      (first_well.get_size_x(), first_well.get_size_y()),
+      field_of_view,
+      center,
+      overlap if overlap is not None else 0.0,
+    )
 
-    await self.driver.set_plate(plate)
+    async with self.driver._operation():
+      await self.driver.set_plate(plate)
 
-    if not self._acquiring:
-      self.start_acquisition()
+      if not self._acquiring:
+        self.start_acquisition()
 
-    try:
-      await self.set_objective(objective)
-      await self.set_imaging_mode(mode, led_intensity=led_intensity)
-      await self.select(row, column)
-      await self.set_gain(gain)
-      if isinstance(focal_height, AutoFocus):
-        if isinstance(exposure_time, AutoExposure) or exposure_time == "machine-auto":
-          raise ValueError("Image autofocus requires a fixed exposure")
-        await self.set_exposure(exposure_time)
-        await self.autofocus(focal_height)
-      else:
-        await self.set_focus(focal_height)
-        if isinstance(exposure_time, AutoExposure):
-          await self.auto_expose(exposure_time)
-        elif exposure_time == "machine-auto":
-          await self.auto_expose()
-        else:
-          await self.set_exposure(exposure_time)
-
-      def image_size(magnification: float) -> Tuple[float, float]:
-        if magnification == 4:
-          return (3474 / 1000, 3474 / 1000)
-        if magnification == 10:
-          # Estimated from the ~13880 um * magnification^-1 pattern of the other entries; the
-          # 4/20/40x values are measured. Refine with a measured 10x field of view if available.
-          return (1388 / 1000, 1388 / 1000)
-        if magnification == 20:
-          return (694 / 1000, 694 / 1000)
-        if magnification == 40:
-          return (347 / 1000, 347 / 1000)
-        raise ValueError(f"Don't know image size for magnification {magnification}")
-
-      if self._objective is None:
-        raise RuntimeError("Objective not set. Run set_objective() first.")
-      magnification = self._objective.magnification
-      img_width, img_height = image_size(magnification)
-
-      first_well = plate.get_item(0)
-      well_size_x, well_size_y = (first_well.get_size_x(), first_well.get_size_y())
-      if coverage == "full":
-        coverage = (
-          math.ceil(well_size_x / image_size(magnification)[0]),
-          math.ceil(well_size_y / image_size(magnification)[1]),
-        )
-      rows, cols = coverage
-
-      if center_position is None:
-        center_position = (0, 0)
-      positions = [
-        (x * img_width + center_position[0], -y * img_height + center_position[1])
-        for y in [i - (rows - 1) / 2 for i in range(rows)]
-        for x in [i - (cols - 1) / 2 for i in range(cols)]
-      ]
-
-      images: List[Image] = []
-      for x_pos, y_pos in positions:
-        await self.set_position(x=x_pos, y=y_pos)
-        t0 = time.time()
-        if mode == ImagingMode.COLOR_BRIGHTFIELD:
-          images.append(await self._acquire_color_brightfield_image(led_intensity=led_intensity))
-        else:
-          images.append(await self.acquire_image())
-        t1 = time.time()
-        logger.debug("[cytation] acquired image in %.2f seconds", t1 - t0)
-    finally:
       try:
-        await self.led_off()
-      except Exception:
-        logger.exception("Failed to turn off LED during cleanup")
-      if auto_stop_acquisition:
-        self.stop_acquisition()
+        await self.set_objective(objective)
+        await self.set_imaging_mode(mode, led_intensity=led_intensity)
+        await self.select(row, column)
+        await self.set_position(*center)
+        await self.set_gain(gain)
+        if isinstance(focal_height, AutoFocus):
+          if isinstance(exposure_time, AutoExposure) or exposure_time == "machine-auto":
+            raise ValueError("Image autofocus requires a fixed exposure")
+          await self.set_exposure(exposure_time)
+          await self.autofocus(focal_height)
+        else:
+          await self.set_focus(focal_height)
+          if isinstance(exposure_time, AutoExposure):
+            await self.auto_expose(exposure_time)
+          elif exposure_time == "machine-auto":
+            await self.auto_expose()
+          else:
+            await self.set_exposure(exposure_time)
 
-    exposure_ms = await self.get_exposure()
-    assert self._focal_height is not None
-    focal_height_val = float(self._focal_height)
+        images: List[Image] = []
+        actual_positions: List[Tuple[float, float]] = []
+        for x_pos, y_pos in positions:
+          await self.set_position(x=x_pos, y=y_pos)
+          assert self._pos_x is not None and self._pos_y is not None
+          actual_positions.append((self._pos_x, self._pos_y))
+          t0 = time.time()
+          if mode == ImagingMode.COLOR_BRIGHTFIELD:
+            images.append(await self._acquire_color_brightfield_image(led_intensity=led_intensity))
+          else:
+            images.append(await self.acquire_image())
+          t1 = time.time()
+          logger.debug("[cytation] acquired image in %.2f seconds", t1 - t0)
+      finally:
+        try:
+          await self.led_off()
+        except Exception:
+          logger.exception("Failed to turn off LED during cleanup")
+        if auto_stop_acquisition:
+          self.stop_acquisition()
 
-    return ImagingResult(images=images, exposure_time=exposure_ms, focal_height=focal_height_val)
+      exposure_ms = await self.get_exposure()
+      assert self._focal_height is not None
+      focal_height_val = float(self._focal_height)
+
+      return ImagingResult(
+        images=images,
+        exposure_time=exposure_ms,
+        focal_height=focal_height_val,
+        tile_positions=actual_positions,
+        tile_grid=grid,
+      )
