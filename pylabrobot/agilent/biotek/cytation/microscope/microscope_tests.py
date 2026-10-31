@@ -20,21 +20,31 @@ def _make_backend(version: str = "2.07"):
   driver.version = version
   driver.send_command = unittest.mock.AsyncMock()
   backend = CytationMicroscope(driver=driver, use_cam=False)
+  backend._focus_resolution = 0.000094
+  backend._position_digits = 7
   return backend, driver
 
 
 class TestFocus(unittest.IsolatedAsyncioTestCase):
-  """Focus positions occupy seven decimal digits, including below 100000 counts."""
+  """Use the firmware's fixed-width position format at every focal height."""
+
+  async def test_six_digit_firmware_uses_reported_position_width(self):
+    """Cytation 5 firmware 1.12 uses six characters instead of seven."""
+    backend, driver = _make_backend(version="1.12")
+    backend._position_digits = 6
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    await backend.set_focus(7.75)
+    driver.send_command.assert_awaited_once_with("i", "F5082447")
 
   async def test_focus_command_has_fixed_width(self):
     """Encode both sides of the six-digit count boundary as complete frames."""
     backend, driver = _make_backend()
     backend._imaging_mode = ImagingMode.BRIGHTFIELD
     for height, command in (
-      (4.5, "F50047876"),
-      (7.0, "F50074473"),
-      (9.4, "F50100007"),
-      (13.5, "F50143627"),
+      (4.5, "F50047872"),
+      (7.0, "F50074468"),
+      (9.4, "F50100000"),
+      (13.5, "F50143617"),
     ):
       with self.subTest(height=height):
         await backend.set_focus(height)
@@ -79,9 +89,9 @@ class TestFocus(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(
       driver.send_command.await_args_list,
       [
-        unittest.mock.call("i", "F50074473"),
+        unittest.mock.call("i", "F50074468"),
         unittest.mock.call("Y", "P0e02", timeout=60),
-        unittest.mock.call("i", "F50074473"),
+        unittest.mock.call("i", "F50074468"),
       ],
     )
 

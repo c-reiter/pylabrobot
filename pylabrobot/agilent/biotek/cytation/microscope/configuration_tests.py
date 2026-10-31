@@ -5,7 +5,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from .configuration import parse_objective_configuration
+from .configuration import (
+  parse_focus_resolution,
+  parse_objective_configuration,
+  parse_position_digits,
+)
 from .microscope import CytationMicroscope
 from .models import ImagingMode, Objective
 
@@ -85,3 +89,21 @@ class TestOpticalConfiguration(unittest.IsolatedAsyncioTestCase):
     assert config is not None
     self.assertIsNone(config.objective)
     self.assertEqual(config.part_number, "A")
+
+  def test_focus_resolution_uses_firmware_units(self) -> None:
+    """The microscope reports micrometers per step, while PLR uses millimeters."""
+    self.assertAlmostEqual(parse_focus_resolution(b"11,00.094\x000000000"), 0.000094)
+
+  def test_position_width_is_read_from_capability(self) -> None:
+    """Motor width is a firmware capability, not a model/version heuristic."""
+    self.assertEqual(parse_position_digits(b"16000000000000000"), 6)
+    self.assertEqual(parse_position_digits(b"17000000000000000"), 7)
+    self.assertEqual(parse_position_digits(b"00000000000000000"), 5)
+    with self.assertRaises(ValueError):
+      parse_position_digits(b"1x000000000000000")
+
+  def test_invalid_focus_resolution_is_rejected(self) -> None:
+    """Never substitute an arbitrary conversion for missing calibration."""
+    for reply in (b"00000000000000000", b"11,00.000\x000000000", b"11,notnum\x000000000"):
+      with self.subTest(reply=reply), self.assertRaises(ValueError):
+        parse_focus_resolution(reply)

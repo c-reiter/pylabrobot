@@ -1,9 +1,43 @@
 """Decode the Cytation 5's fixed-width optical configuration records."""
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 from .models import Objective
+
+
+def parse_position_digits(capability: bytes) -> int:
+  """Decode capability 2102, the width of signed motor position fields."""
+  if len(capability) != 17:
+    raise ValueError(f"Malformed Cytation position capability: {capability!r}")
+  if capability[:1] == b"0":
+    return 5
+  if capability[:1] != b"1" or capability[1:2] not in b"56789":
+    raise ValueError(f"Unsupported Cytation position capability: {capability!r}")
+  return int(capability[1:2])
+
+
+def parse_focus_resolution(capability: bytes) -> float:
+  """Decode capability 2098 as millimeters per fine-focus motor step."""
+  if len(capability) != 17 or capability[:1] != b"1":
+    raise ValueError(f"Missing Cytation focus capability: {capability!r}")
+  mode = capability[1:2]
+  if mode in (b"0", b"1"):
+    field = capability[3:9]
+  elif mode == b"2":
+    field = capability[3:12]
+  elif mode == b"4":
+    field = capability[10:16]
+  else:
+    raise ValueError(f"Unsupported Cytation focus capability: {capability!r}")
+  try:
+    resolution = float(field.rstrip(b"\x00 ")) / 1000
+  except ValueError as exc:
+    raise ValueError(f"Malformed Cytation focus resolution: {field!r}") from exc
+  if not math.isfinite(resolution) or resolution <= 0:
+    raise ValueError(f"Invalid Cytation focus resolution: {field!r}")
+  return resolution
 
 
 _OBJECTIVES = {

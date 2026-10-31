@@ -29,7 +29,12 @@ from pylabrobot.agilent.biotek.cytation.microscope.models import (
 from pylabrobot.resources.plate import Plate
 
 from .aravis_camera import AravisCamera
-from .configuration import CytationObjectiveConfiguration, parse_objective_configuration
+from .configuration import (
+  CytationObjectiveConfiguration,
+  parse_focus_resolution,
+  parse_objective_configuration,
+  parse_position_digits,
+)
 
 if TYPE_CHECKING:
   from pylabrobot.agilent.biotek.plate_reader_base import BioTekPlateReaderDriver
@@ -85,6 +90,8 @@ class CytationMicroscope:
     self._objective_configurations: List[Optional[CytationObjectiveConfiguration]] = []
     self._exposure: Optional[Exposure] = None
     self._focal_height: Optional[FocalPosition] = None
+    self._focus_resolution: Optional[float] = None
+    self._position_digits: Optional[int] = None
     self._gain: Optional[Gain] = None
     self._imaging_mode: Optional[ImagingMode] = None
     self._row: Optional[int] = None
@@ -107,6 +114,8 @@ class CytationMicroscope:
       await self._load_filters()
     if self._objectives is None:
       await self._load_objectives()
+    self._focus_resolution = parse_focus_resolution(await self.driver.query_capability(2098))
+    self._position_digits = parse_position_digits(await self.driver.query_capability(2102))
 
   async def _on_stop(self) -> None:
     self._clear_imaging_state()
@@ -116,6 +125,20 @@ class CytationMicroscope:
       logger.exception("Error stopping camera")
 
   # ─── Properties ─────────────────────────────────────────────────────
+
+  @property
+  def position_digits(self) -> int:
+    """Number of characters in a motor position, reported by the instrument."""
+    if self._position_digits is None:
+      raise RuntimeError("Motor position format not loaded. Call setup() first.")
+    return self._position_digits
+
+  @property
+  def focus_resolution(self) -> float:
+    """Fine-focus millimeters per motor step, reported by the instrument."""
+    if self._focus_resolution is None:
+      raise RuntimeError("Focus resolution not loaded. Call setup() first.")
+    return self._focus_resolution
 
   @property
   def filters(self) -> List[Optional[ImagingMode]]:
@@ -379,12 +402,13 @@ class CytationMicroscope:
     if focal_position == self._focal_height:
       return
 
-    slope, intercept = (10.637991436186072, 1.0243013203461762)
-    counts = position + intercept + slope * position * 1000
-    if not math.isfinite(counts) or counts >= 10_000_000:
-      raise ValueError("focal_position exceeds the seven-digit focus position field")
-    focus_integer = int(counts)
-    focus_str = f"{focus_integer:07d}"
+    counts = position / self.focus_resolution
+    if not math.isfinite(counts) or counts >= 10**self.position_digits:
+      raise ValueError("focal_position exceeds the instrument's focus position field")
+    focus_integer = int(counts + 0.5)
+    if focus_integer >= 10**self.position_digits:
+      raise ValueError("focal_position exceeds the instrument's focus position field")
+    focus_str = f"{focus_integer:0{self.position_digits}d}"
 
     if self._imaging_mode is None:
       raise ValueError("Imaging mode not set. Call set_imaging_mode() first.")
