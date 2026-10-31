@@ -140,3 +140,69 @@ class TestCytationTemperature(unittest.IsolatedAsyncioTestCase):
       with self.assertRaisesRegex(ValueError, "steps of 1.0"):
         await reader.set_temperature(30.5)
       command.assert_not_awaited()
+
+
+class TestCytationTimeResolvedFluorescence(unittest.IsolatedAsyncioTestCase):
+  """Validate flash timing and capability selection without accessing a reader."""
+
+  async def test_timing_conversion_and_capability(self) -> None:
+    """Public seconds become whole microseconds in the gated endpoint request."""
+    reader = Cytation5("reader", use_cam=False)
+    plate = cor_96_wellplate_360uL_Fb("plate")
+    with (
+      patch.object(reader, "query_capability", new_callable=AsyncMock) as capability,
+      patch.object(reader, "_read_fluorescence", new_callable=AsyncMock) as read,
+    ):
+      capability.return_value = b"101" + b"0" * 14
+      read.return_value = []
+      result = await reader.read_time_resolved_fluorescence(
+        plate, plate["A3"], 360, 620, 6, delay=0.0001, integration_time=0.0005
+      )
+      self.assertEqual(result, [])
+      capability.assert_awaited_once_with(2006)
+      read.assert_awaited_once_with(
+        plate,
+        plate["A3"],
+        360,
+        620,
+        6,
+        delay_microseconds=100,
+        collection_microseconds=500,
+      )
+
+  async def test_unavailable_monochromator_trf_does_not_read(self) -> None:
+    """Filter-only TRF support does not imply monochromator TRF support."""
+    reader = Cytation5("reader", use_cam=False)
+    plate = cor_96_wellplate_360uL_Fb("plate")
+    with (
+      patch.object(reader, "query_capability", new_callable=AsyncMock) as capability,
+      patch.object(reader, "_read_fluorescence", new_callable=AsyncMock) as read,
+    ):
+      for data in (b"0" * 17, b"110" + b"0" * 14):
+        capability.return_value = data
+        with self.assertRaises(NotImplementedError):
+          await reader.read_time_resolved_fluorescence(plate, plate["A3"], 360, 620, 6)
+      read.assert_not_awaited()
+
+  async def test_invalid_timings_do_not_query_hardware(self) -> None:
+    """Reject out-of-range, nonfinite and sub-microsecond requests before I/O."""
+    reader = Cytation5("reader", use_cam=False)
+    plate = cor_96_wellplate_360uL_Fb("plate")
+    with patch.object(reader, "query_capability", new_callable=AsyncMock) as capability:
+      for delay, duration in (
+        (-0.000001, 0.0003),
+        (0.002001, 0.0003),
+        (0, 0),
+        (0, 0.000019),
+        (0, 0.002001),
+        (0.0000005, 0.0003),
+        (0, 0.0003005),
+        (float("nan"), 0.0003),
+        (0, float("inf")),
+      ):
+        with self.subTest(delay=delay, duration=duration):
+          with self.assertRaises(ValueError):
+            await reader.read_time_resolved_fluorescence(
+              plate, plate["A3"], 360, 620, 6, delay, duration
+            )
+      capability.assert_not_awaited()

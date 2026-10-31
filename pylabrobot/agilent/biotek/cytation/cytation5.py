@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from pylabrobot.agilent.biotek._reader import BioTekError
-from pylabrobot.resources import Plate
+from pylabrobot.agilent.biotek.results import FluorescenceResult
+from pylabrobot.resources import Plate, Well
 
 from pylabrobot.agilent.biotek.cytation.base import _CytationBase
 from pylabrobot.agilent.biotek.cytation.microscope.microscope import (
@@ -92,6 +93,57 @@ class Cytation5(_CytationBase):
     """Disable incubation using this firmware's temperature field lengths."""
     async with self._operation():
       return await self.send_command("g", await self._temperature_parameters(0, 0), timeout=40)
+
+  async def read_time_resolved_fluorescence(
+    self,
+    plate: Plate,
+    wells: List[Well],
+    excitation_wavelength: int,
+    emission_wavelength: int,
+    focal_height: float,
+    delay: float = 0.0001,
+    integration_time: float = 0.0003,
+  ) -> List[FluorescenceResult]:
+    """Read flash-excited, time-resolved fluorescence through the monochromators.
+
+    Uses ten flashes, 20 nm bandwidths and gain 100. Timing is performed by the
+    instrument after each excitation flash, rather than by host-side sleeps.
+    This operation has not yet been validated on hardware.
+
+    Args:
+      plate: Plate to read.
+      wells: Wells to read.
+      excitation_wavelength: Excitation wavelength in nm.
+      emission_wavelength: Emission wavelength in nm.
+      focal_height: Focal height in mm.
+      delay: Delay after each flash, in seconds, from 0 to 0.002.
+      integration_time: Collection duration in seconds, from 0.00002 to 0.002.
+        Both timings must be whole multiples of one microsecond.
+    """
+    timing = (delay, integration_time)
+    if any(not math.isfinite(value) for value in timing):
+      raise ValueError("Fluorescence timing must be finite")
+    if not 0 <= delay <= 0.002 or not 0.00002 <= integration_time <= 0.002:
+      raise ValueError("Delay must be 0–0.002 s and integration time 0.00002–0.002 s")
+    if any(
+      not math.isclose(value * 1_000_000, round(value * 1_000_000), abs_tol=1e-8)
+      for value in timing
+    ):
+      raise ValueError("Fluorescence timing requires whole microsecond steps")
+    async with self._operation():
+      capability = await self.query_capability(2006)
+      if capability[:1] != b"1" or capability[2:3] != b"1":
+        raise NotImplementedError("This Cytation has no monochromator time-resolved fluorescence")
+      logger.warning("Cytation time-resolved fluorescence has not yet been validated on hardware")
+      return await self._read_fluorescence(
+        plate,
+        wells,
+        excitation_wavelength,
+        emission_wavelength,
+        focal_height,
+        delay_microseconds=round(delay * 1_000_000),
+        collection_microseconds=round(integration_time * 1_000_000),
+      )
 
   def _reset_state(self) -> None:
     """Discard optics and plate position assumptions after disconnecting."""

@@ -70,6 +70,8 @@ def encode_fluorescence(
   bounds: Tuple[int, int, int, int],
   excitation_wavelength: int,
   emission_wavelength: int,
+  delay_microseconds: int = 0,
+  collection_microseconds: int = 0,
 ) -> str:
   """Encode the monochromator endpoint layout with ten flashes and gain 100."""
   min_row, min_col, max_row, max_col = bounds
@@ -77,10 +79,17 @@ def encode_fluorescence(
     raise ValueError("BioTek assay bounds must be ordered and between 1 and 99")
   if not (1 <= excitation_wavelength <= 9999 and 1 <= emission_wavelength <= 9999):
     raise ValueError("BioTek wavelengths must fit four decimal digits")
+  if not 0 <= delay_microseconds <= 2000:
+    raise ValueError("Fluorescence delay must be 0–2000 microseconds")
+  if collection_microseconds != 0 and not 20 <= collection_microseconds <= 2000:
+    raise ValueError("Fluorescence collection must be 20–2000 microseconds")
+  if delay_microseconds and not collection_microseconds:
+    raise ValueError("A fluorescence delay requires a collection duration")
   header = f"01{min_row:02}{min_col:02}{max_row:02}{max_col:02}0001200100001"
   read_event = "1001000001"
   optics = (
-    f"35000100200200{excitation_wavelength:04}000{emission_wavelength:04}00000000000000000021001"
+    f"35000100200200{excitation_wavelength:04}000{emission_wavelength:04}000"
+    f"00000{delay_microseconds:05}{collection_microseconds:05}21001"
   )
   return encode_assay(header + read_event + optics)
 

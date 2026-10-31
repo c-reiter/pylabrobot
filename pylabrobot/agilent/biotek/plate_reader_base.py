@@ -457,23 +457,17 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         )
       ]
 
-  async def read_fluorescence(
+  async def _read_fluorescence(
     self,
     plate: Plate,
     wells: List[Well],
     excitation_wavelength: int,
     emission_wavelength: int,
     focal_height: float,
+    delay_microseconds: int = 0,
+    collection_microseconds: int = 0,
   ) -> List[FluorescenceResult]:
-    """Read endpoint fluorescence through the monochromator optical path.
-
-    Args:
-      plate: Plate to read.
-      wells: Wells to read.
-      excitation_wavelength: Excitation wavelength in nm.
-      emission_wavelength: Emission wavelength in nm.
-      focal_height: Focal height in mm.
-    """
+    """Execute a monochromator endpoint read with optional hardware-gated timing."""
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
       raise ValueError(f"{self.__class__.__name__}: focal height must be within {min_fh}-{max_fh}")
@@ -511,6 +505,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
           bounds=(min_row + 1, min_col + 1, max_row + 1, max_col + 1),
           excitation_wavelength=excitation_wavelength,
           emission_wavelength=emission_wavelength,
+          delay_microseconds=delay_microseconds,
+          collection_microseconds=collection_microseconds,
         )
         parse_assay_response(await self.send_command("D", cmd))
 
@@ -538,6 +534,27 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
           timestamp=datetime.now(),
         )
       ]
+
+  async def read_fluorescence(
+    self,
+    plate: Plate,
+    wells: List[Well],
+    excitation_wavelength: int,
+    emission_wavelength: int,
+    focal_height: float,
+  ) -> List[FluorescenceResult]:
+    """Read endpoint fluorescence through the monochromator optical path.
+
+    Args:
+      plate: Plate to read.
+      wells: Wells to read.
+      excitation_wavelength: Excitation wavelength in nm.
+      emission_wavelength: Emission wavelength in nm.
+      focal_height: Focal height in mm.
+    """
+    return await self._read_fluorescence(
+      plate, wells, excitation_wavelength, emission_wavelength, focal_height
+    )
 
   async def _abort(self) -> None:
     """Abort an active cycle and consume its DLE/status completion frame."""

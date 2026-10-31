@@ -64,6 +64,26 @@ def test_luminescence_integration_field(ticks: int) -> None:
   assert packet[-3:] == f"{sum(packet[4:-3].encode()) % 256:03}"
 
 
+def test_time_resolved_fluorescence_timing_fields() -> None:
+  """The RDOP22 layout places both five-digit timing fields before energy and gain."""
+  packet = encode_fluorescence((1, 3, 1, 3), 360, 620, 100, 500)
+  assert packet == (
+    "0084010103010300012001000011001000001350001002002000360000062000000000001000050021001105"
+  )
+  optics = packet[37:-3]
+  assert optics[28:33] == "00000"
+  assert optics[33:38] == "00100"
+  assert optics[38:43] == "00500"
+  assert optics[43:] == "21001"
+
+
+@pytest.mark.parametrize("delay, collection", [(-1, 300), (2001, 300), (0, 19), (0, 2001), (1, 0)])
+def test_invalid_time_resolved_fields(delay: int, collection: int) -> None:
+  """Timing limits also protect the low-level encoder."""
+  with pytest.raises(ValueError):
+    encode_fluorescence((1, 3, 1, 3), 360, 620, delay, collection)
+
+
 def test_assay_reply() -> None:
   """Accept the recorded D reply used by the existing reader tests."""
   assert parse_assay_response(ASSAY_REPLY) == b"000000000000001000000000049"
