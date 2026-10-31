@@ -66,6 +66,25 @@ def test_luminescence_integration_field(ticks: int) -> None:
   assert packet[-3:] == f"{sum(packet[4:-3].encode()) % 256:03}"
 
 
+@pytest.mark.parametrize("wavelength, bandwidth", [(500, 9), (620, 30), (700, 50)])
+def test_monochromator_luminescence_layout(wavelength: int, bandwidth: int) -> None:
+  """The monochromator path replaces broadband selection without enabling excitation."""
+  packet = encode_luminescence(
+    (1, 3, 1, 3),
+    10,
+    emission_wavelength=wavelength,
+    emission_bandwidth=bandwidth,
+    gain=150,
+    dynamic_range="standard",
+  )
+  optics = packet[37:-3]
+  assert len(packet) == 88
+  assert optics[:14] == f"2500010020{bandwidth:03}0"
+  assert optics[14:28] == f"-001000{wavelength:04}000"
+  assert optics[28:] == "00000000000000001500"
+  assert packet[-3:] == f"{sum(packet[4:-3].encode()) % 256:03}"
+
+
 def test_time_resolved_fluorescence_timing_fields() -> None:
   """The RDOP22 layout places both five-digit timing fields before energy and gain."""
   packet = encode_fluorescence((1, 3, 1, 3), 360, 620, 100, 500)
@@ -269,6 +288,41 @@ class TestReaderNegotiation(unittest.IsolatedAsyncioTestCase):
         assert packet[40:44] == f"{ticks:04}"
         assert result[0].data[0][0] == 3
 
+  async def test_monochromator_luminescence_probe_and_metadata(self) -> None:
+    """Wavelength selection switches to the mono probe and is retained in the result."""
+    self.reader._plate = self.plate
+    self.reader.set_plate = AsyncMock()
+    self.reader._temperature_after_read = AsyncMock(return_value=14.2)
+    self.reader.query_capability = AsyncMock(return_value=b"11" + b"0" * 15)
+    self.reader.send_command = AsyncMock(side_effect=[b"0000\x03", ASSAY_REPLY, b"\x060000\x03"])
+    self.reader._read_until = AsyncMock(
+      return_value=bytes.fromhex(BOTTOM_CAPTURE["acquisition_reply_hex"])[6:]
+    )
+    result = await self.reader.read_luminescence(
+      self.plate, self.plate["A3"], 6, 0.2, emission_wavelength=620, emission_bandwidth=30
+    )
+    assert self.reader.send_command.call_args_list[0] == call("t", "620220\x03")
+    assert result[0].emission_wavelength == 620
+    assert result[0].emission_bandwidth == 30
+    assert result[0].data[0][2] == 0
+
+  async def test_invalid_luminescence_optics_before_movement(self) -> None:
+    """Reject unsupported wavelengths and incoherent bandwidth selection before I/O."""
+    for options in (
+      {"emission_wavelength": 249},
+      {"emission_wavelength": 701},
+      {"emission_wavelength": 620.5},
+      {"emission_bandwidth": 30},
+      {"emission_wavelength": 620, "emission_bandwidth": 51},
+      {"emission_wavelength": 620, "emission_bandwidth": True},
+      {"gain": 256},
+      {"dynamic_range": "auto"},
+    ):
+      with self.subTest(options=options):
+        with pytest.raises(ValueError):
+          await self.reader.read_luminescence(self.plate, self.plate["A3"], 6, 0.2, **options)
+        self.io.write.assert_not_called()
+
   async def test_optical_assay_error_does_not_start_read(self) -> None:
     """Fluorescence and luminescence validate D replies before starting acquisition."""
     self.reader.set_plate = AsyncMock()
@@ -323,6 +377,20 @@ class TestReaderNegotiation(unittest.IsolatedAsyncioTestCase):
       call("O"),
     ]
     assert result[0].data[0][2] == 0
+
+  async def test_high_flash_plate_read_has_extended_timeout(self) -> None:
+    """A full plate at 255 flashes must not inherit the short endpoint timeout."""
+    self.reader._plate = self.plate
+    self.reader.set_plate = AsyncMock()
+    self.reader._temperature_after_read = AsyncMock(return_value=14.2)
+    self.reader.send_command = AsyncMock(side_effect=[ASSAY_REPLY, b"\x060000\x03"])
+    self.reader._read_until = AsyncMock(
+      return_value=bytes.fromhex(BOTTOM_CAPTURE["acquisition_reply_hex"])[6:]
+    )
+    await self.reader.read_fluorescence(
+      self.plate, self.plate.get_all_items(), 360, 620, 6, read_from="bottom", flashes=255
+    )
+    assert self.reader._read_until.call_args.kwargs["timeout"] > 120
 
   async def test_bandwidth_capability_before_movement(self) -> None:
     """Reject unsupported or narrower-than-installed slits before configuring the plate."""

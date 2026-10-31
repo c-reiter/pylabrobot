@@ -145,16 +145,31 @@ def encode_luminescence(
   *,
   gain: int = 135,
   dynamic_range: Literal["standard", "extended"] = "extended",
+  emission_wavelength: Optional[int] = None,
+  emission_bandwidth: int = 20,
 ) -> str:
-  """Encode the broadband endpoint layout with integration in 20 ms ticks."""
+  """Encode broadband or top-monochromator luminescence in 20 ms ticks."""
   min_row, min_col, max_row, max_col = bounds
   validate_detector_settings(gain, dynamic_range)
   if not (1 <= min_row <= max_row <= 99 and 1 <= min_col <= max_col <= 99):
     raise ValueError("BioTek assay bounds must be ordered and between 1 and 99")
   if not 1 <= integration_ticks <= 3000:
     raise ValueError("BioTek luminescence integration must be 1–3000 ticks")
+  if emission_wavelength is not None and (
+    type(emission_wavelength) is not int or not 1 <= emission_wavelength <= 9999
+  ):
+    raise ValueError("Emission wavelength must be an integer fitting four digits")
+  if type(emission_bandwidth) is not int or not 3 <= emission_bandwidth <= 50:
+    raise ValueError("Emission bandwidth must be an integer between 3 and 50 nm")
+  if emission_wavelength is None and emission_bandwidth != 20:
+    raise ValueError("Emission bandwidth requires a selected emission wavelength")
   header = f"01{min_row:02}{min_col:02}{max_row:02}{max_col:02}0001200100001"
   read_event = "1001000001"
   range_code = "1" if dynamic_range == "extended" else "0"
-  optics = f"230{integration_ticks:04}0200200-001000-0030000000000000000000{gain:03}{range_code}"
+  path = "3" if emission_wavelength is None else "5"
+  emission = -3 if emission_wavelength is None else emission_wavelength
+  optics = (
+    f"2{path}0{integration_ticks:04}020{emission_bandwidth:03}0-001000{emission:04}000"
+    f"0000000000000000{gain:03}{range_code}"
+  )
   return encode_assay(header + read_event + optics)

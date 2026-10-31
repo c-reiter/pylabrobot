@@ -387,6 +387,17 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         )
       ]
 
+  async def _validate_bandwidths(self, excitation: int, emission: int) -> None:
+    """Check non-default slit widths against the reader's installed monochromators."""
+    if excitation == 20 and emission == 20:
+      return
+    capability = await self.query_capability(2108)
+    if capability[:1] != b"1":
+      raise NotImplementedError("This reader does not support variable monochromator bandwidth")
+    minimum = 3 if capability[1:2] == b"2" else 9
+    if min(excitation, emission) < minimum:
+      raise ValueError(f"This reader requires bandwidths between {minimum} and 50 nm")
+
   async def read_luminescence(
     self,
     plate: Plate,
@@ -396,6 +407,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     *,
     gain: int = 135,
     dynamic_range: Literal["standard", "extended"] = "extended",
+    emission_wavelength: Optional[int] = None,
+    emission_bandwidth: int = 20,
   ) -> List[LuminescenceResult]:
     """Read luminescence.
 
@@ -406,6 +419,10 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       integration_time: Integration time in seconds, from 0.2 to 60 in steps of 0.2.
       gain: PMT sensitivity, 0 or an integer from 25 to 255.
       dynamic_range: Standard or extended result range.
+      emission_wavelength: Emission wavelength in nm, or None for broadband light.
+        Selecting a wavelength uses the top emission monochromator.
+      emission_bandwidth: Monochromator bandwidth in nm, 9–50 on this Cytation 5.
+        Only applies when emission_wavelength is selected.
     """
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
@@ -417,6 +434,14 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       raise ValueError("Integration time must be a multiple of 0.2 seconds")
     integration_ticks = round(integration_time * 50)
     validate_detector_settings(gain, dynamic_range)
+    if emission_wavelength is not None:
+      lower, upper = self.emission_range
+      if type(emission_wavelength) is not int or not lower <= emission_wavelength <= upper:
+        raise ValueError(f"Emission wavelength must be an integer between {lower} and {upper} nm")
+    if type(emission_bandwidth) is not int or not 3 <= emission_bandwidth <= 50:
+      raise ValueError("Emission bandwidth must be an integer between 3 and 50 nm")
+    if emission_wavelength is None and emission_bandwidth != 20:
+      raise ValueError("Emission bandwidth requires a selected emission wavelength")
 
     async with self._operation():
       logger.info(
@@ -425,10 +450,12 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         plate.name,
         len(wells),
       )
+      await self._validate_bandwidths(20, emission_bandwidth)
       await self.set_plate(plate)
       await self._prepare_plate_read()
 
-      cmd = f"3{14220 + int(1000 * focal_height)}\x03"
+      probe = "3" if emission_wavelength is None else "6"
+      cmd = f"{probe}{14220 + int(1000 * focal_height)}\x03"
       parse_response(await self.send_command("t", cmd), "t")
 
       all_data: List[List[Optional[float]]] = [
@@ -440,6 +467,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
           integration_ticks=integration_ticks,
           gain=gain,
           dynamic_range=dynamic_range,
+          emission_wavelength=emission_wavelength,
+          emission_bandwidth=emission_bandwidth,
         )
         parse_assay_response(await self.send_command("D", cmd))
 
@@ -464,6 +493,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
           data=all_data,
           temperature=temp,
           timestamp=datetime.now(),
+          emission_wavelength=emission_wavelength,
+          emission_bandwidth=emission_bandwidth if emission_wavelength is not None else None,
         )
       ]
 
@@ -512,13 +543,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         emission_wavelength,
         len(wells),
       )
-      if excitation_bandwidth != 20 or emission_bandwidth != 20:
-        capability = await self.query_capability(2108)
-        if capability[:1] != b"1":
-          raise NotImplementedError("This reader does not support variable monochromator bandwidth")
-        minimum = 3 if capability[1:2] == b"2" else 9
-        if min(excitation_bandwidth, emission_bandwidth) < minimum:
-          raise ValueError(f"This reader requires bandwidths between {minimum} and 50 nm")
+      await self._validate_bandwidths(excitation_bandwidth, emission_bandwidth)
       await self.set_plate(plate)
       await self._prepare_plate_read()
 
@@ -551,7 +576,11 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         if resp != b"\x060000\x03":
           raise ValueError(f"BioTek O: expected ACK and status, received {resp!r}")
 
-        body = await self._read_until(b"\x03", timeout=60 * 2)
+        # Allow long multiwell reads at high flash counts to finish. The margin
+        # covers carrier movement and slower high-energy lamp recharge.
+        well_count = (max_row - min_row + 1) * (max_col - min_col + 1)
+        timeout = max(120.0, 60 + well_count * (1 + flashes / 10))
+        body = await self._read_until(b"\x03", timeout=timeout)
         assert body is not None
         parsed_data = self._parse_body(body)
         for r in range(plate.num_items_y):
