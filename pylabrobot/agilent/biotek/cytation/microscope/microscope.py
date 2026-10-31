@@ -454,23 +454,32 @@ class CytationMicroscope:
       await self.driver.send_command("Y", f"P0e{obj_code:02}", timeout=60)
     self._objective = objective
     self._imaging_mode = None  # force re-set after objective change
+    self._focal_height = None
+    self._pos_x, self._pos_y = None, None
 
   async def set_focus(self, focal_position: FocalPosition) -> None:
     """Move focus motor to the specified height (mm)."""
     if focal_position == "machine-auto":
       raise ValueError("focal_position cannot be 'machine-auto'. Use PLR's auto-focus instead.")
 
+    position = float(focal_position)
+    if not math.isfinite(position) or position < 0:
+      raise ValueError("focal_position must be a finite, nonnegative height in mm")
+
     if focal_position == self._focal_height:
       return
 
     slope, intercept = (10.637991436186072, 1.0243013203461762)
-    focus_integer = int(float(focal_position) + intercept + slope * float(focal_position) * 1000)
-    focus_str = str(focus_integer).zfill(5)
+    counts = position + intercept + slope * position * 1000
+    if not math.isfinite(counts) or counts >= 10_000_000:
+      raise ValueError("focal_position exceeds the seven-digit focus position field")
+    focus_integer = int(counts)
+    focus_str = f"{focus_integer:07d}"
 
     if self._imaging_mode is None:
       raise ValueError("Imaging mode not set. Call set_imaging_mode() first.")
     imaging_mode_code = self._imaging_mode_code(self._imaging_mode)
-    await self.driver.send_command("i", f"F{imaging_mode_code}0{focus_str}")
+    await self.driver.send_command("i", f"F{imaging_mode_code}{focus_str}")
 
     self._focal_height = focal_position
 

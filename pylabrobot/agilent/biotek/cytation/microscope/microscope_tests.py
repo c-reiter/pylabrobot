@@ -11,7 +11,7 @@ from pylabrobot.agilent.biotek.cytation.microscope.microscope import (
   COLOR_BRIGHTFIELD_LED_CODES,
   CytationMicroscope,
 )
-from pylabrobot.agilent.biotek.cytation.microscope.models import ImagingMode
+from pylabrobot.agilent.biotek.cytation.microscope.models import ImagingMode, Objective
 
 
 def _make_backend(version: str = "2.07"):
@@ -21,6 +21,69 @@ def _make_backend(version: str = "2.07"):
   driver.send_command = unittest.mock.AsyncMock()
   backend = CytationMicroscope(driver=driver, use_cam=False)
   return backend, driver
+
+
+class TestFocus(unittest.IsolatedAsyncioTestCase):
+  """Focus positions occupy seven decimal digits, including below 100000 counts."""
+
+  async def test_focus_command_has_fixed_width(self):
+    """Encode both sides of the six-digit count boundary as complete frames."""
+    backend, driver = _make_backend()
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    for height, command in (
+      (4.5, "F50047876"),
+      (7.0, "F50074473"),
+      (9.4, "F50100007"),
+      (13.5, "F50143627"),
+    ):
+      with self.subTest(height=height):
+        await backend.set_focus(height)
+        driver.send_command.assert_awaited_with("i", command)
+        self.assertEqual(backend._focal_height, height)
+
+  async def test_refused_focus_is_not_cached(self):
+    """A refused move must be retried rather than skipped as already complete."""
+    backend, driver = _make_backend()
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    driver.send_command.side_effect = RuntimeError("BioTek reported error 0x570F")
+    for _ in range(2):
+      with self.assertRaisesRegex(RuntimeError, "570F"):
+        await backend.set_focus(7.0)
+    self.assertIsNone(backend._focal_height)
+    self.assertEqual(driver.send_command.await_count, 2)
+
+  async def test_invalid_positions_do_not_send_commands(self):
+    """Invalid numbers must never reach the motor's ASCII position field."""
+    backend, driver = _make_backend()
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    for height in (-1, float("nan"), float("inf"), float("-inf"), 1e308, 1000):
+      with self.subTest(height=height):
+        with self.assertRaises(ValueError):
+          await backend.set_focus(height)
+    driver.send_command.assert_not_awaited()
+
+  async def test_objective_change_requires_focus_and_position_to_be_reapplied(self):
+    """Objective motion invalidates focus and within-well positioning caches."""
+    backend, driver = _make_backend()
+    backend._objectives = [Objective.O_4X_PL_FL, Objective.O_10X_PL_FL_Phase]
+    backend._objective = Objective.O_4X_PL_FL
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    backend._pos_x, backend._pos_y = 0, 0
+    await backend.set_focus(7.0)
+    await backend.set_objective(Objective.O_10X_PL_FL_Phase)
+    self.assertIsNone(backend._focal_height)
+    self.assertIsNone(backend._pos_x)
+    self.assertIsNone(backend._pos_y)
+    backend._imaging_mode = ImagingMode.BRIGHTFIELD
+    await backend.set_focus(7.0)
+    self.assertEqual(
+      driver.send_command.await_args_list,
+      [
+        unittest.mock.call("i", "F50074473"),
+        unittest.mock.call("Y", "P0e02", timeout=60),
+        unittest.mock.call("i", "F50074473"),
+      ],
+    )
 
 
 class TestColorBrightfield(unittest.IsolatedAsyncioTestCase):
