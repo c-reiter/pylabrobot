@@ -168,6 +168,13 @@ class TestCytationTimeResolvedFluorescence(unittest.IsolatedAsyncioTestCase):
         6,
         delay_microseconds=100,
         collection_microseconds=500,
+        gain=100,
+        dynamic_range="extended",
+        read_from="top",
+        excitation_bandwidth=20,
+        emission_bandwidth=20,
+        flashes=10,
+        lamp_energy="high",
       )
 
   async def test_unavailable_monochromator_trf_does_not_read(self) -> None:

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 from pylabrobot.agilent.biotek._reader import BioTekError
+from pylabrobot.agilent.biotek.plate_reader_protocol import validate_fluorescence_settings
 from pylabrobot.agilent.biotek.results import FluorescenceResult
 from pylabrobot.resources import Plate, Well
 
@@ -103,11 +104,19 @@ class Cytation5(_CytationBase):
     focal_height: float,
     delay: float = 0.0001,
     integration_time: float = 0.0003,
+    *,
+    gain: int = 100,
+    dynamic_range: Literal["standard", "extended"] = "extended",
+    read_from: Literal["top", "bottom"] = "top",
+    excitation_bandwidth: int = 20,
+    emission_bandwidth: int = 20,
+    flashes: int = 10,
+    lamp_energy: Literal["low", "high"] = "high",
   ) -> List[FluorescenceResult]:
     """Read flash-excited, time-resolved fluorescence through the monochromators.
 
-    Uses ten flashes, 20 nm bandwidths and gain 100. Timing is performed by the
-    instrument after each excitation flash, rather than by host-side sleeps.
+    Timing is performed by the instrument after each excitation flash. Optical
+    settings have the same meaning as in :meth:`read_fluorescence`.
 
     Args:
       plate: Plate to read.
@@ -118,7 +127,17 @@ class Cytation5(_CytationBase):
       delay: Delay after each flash, in seconds, from 0 to 0.002.
       integration_time: Collection duration in seconds, from 0.00002 to 0.002.
         Both timings must be whole multiples of one microsecond.
+      gain: PMT sensitivity, 0 or an integer from 25 to 255.
+      dynamic_range: Standard or extended result range.
+      read_from: Top or bottom monochromator optics.
+      excitation_bandwidth: Excitation bandwidth in nm, 9–50 on this instrument.
+      emission_bandwidth: Emission bandwidth in nm, 9–50 on this instrument.
+      flashes: Excitation flashes per well, from 1 to 255.
+      lamp_energy: Low or high excitation flash energy.
     """
+    validate_fluorescence_settings(
+      gain, dynamic_range, read_from, excitation_bandwidth, emission_bandwidth, flashes, lamp_energy
+    )
     timing = (delay, integration_time)
     if any(not math.isfinite(value) for value in timing):
       raise ValueError("Fluorescence timing must be finite")
@@ -141,6 +160,13 @@ class Cytation5(_CytationBase):
         focal_height,
         delay_microseconds=round(delay * 1_000_000),
         collection_microseconds=round(integration_time * 1_000_000),
+        gain=gain,
+        dynamic_range=dynamic_range,
+        read_from=read_from,
+        excitation_bandwidth=excitation_bandwidth,
+        emission_bandwidth=emission_bandwidth,
+        flashes=flashes,
+        lamp_energy=lamp_energy,
       )
 
   def _reset_state(self) -> None:

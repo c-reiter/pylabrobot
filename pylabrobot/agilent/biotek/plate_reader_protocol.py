@@ -1,6 +1,6 @@
 """Framing and endpoint assay records for the BioTek RDOP22 protocol."""
 
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 
 def parse_response(response: Optional[bytes], command: str) -> bytes:
@@ -66,14 +66,55 @@ def encode_absorbance(
   return encode_assay(header + read_event + optics)
 
 
+def validate_detector_settings(gain: int, dynamic_range: Literal["standard", "extended"]) -> None:
+  """Validate the PMT sensitivity and result range before any instrument movement."""
+  if type(gain) is not int or (gain != 0 and not 25 <= gain <= 255):
+    raise ValueError("Gain must be an integer: 0 or between 25 and 255")
+  if dynamic_range not in ("standard", "extended"):
+    raise ValueError("Dynamic range must be 'standard' or 'extended'")
+
+
+def validate_fluorescence_settings(
+  gain: int,
+  dynamic_range: Literal["standard", "extended"],
+  read_from: Literal["top", "bottom"],
+  excitation_bandwidth: int,
+  emission_bandwidth: int,
+  flashes: int,
+  lamp_energy: Literal["low", "high"],
+) -> None:
+  """Check monochromator settings; the device-specific bandwidth limit is separate."""
+  validate_detector_settings(gain, dynamic_range)
+  if read_from not in ("top", "bottom"):
+    raise ValueError("Read direction must be 'top' or 'bottom'")
+  for bandwidth in (excitation_bandwidth, emission_bandwidth):
+    if type(bandwidth) is not int or not 3 <= bandwidth <= 50:
+      raise ValueError("Bandwidth must be an integer between 3 and 50 nm")
+  if type(flashes) is not int or not 1 <= flashes <= 255:
+    raise ValueError("Flashes must be an integer between 1 and 255")
+  if lamp_energy not in ("low", "high"):
+    raise ValueError("Lamp energy must be 'low' or 'high'")
+
+
 def encode_fluorescence(
   bounds: Tuple[int, int, int, int],
   excitation_wavelength: int,
   emission_wavelength: int,
   delay_microseconds: int = 0,
   collection_microseconds: int = 0,
+  *,
+  gain: int = 100,
+  dynamic_range: Literal["standard", "extended"] = "extended",
+  read_from: Literal["top", "bottom"] = "top",
+  excitation_bandwidth: int = 20,
+  emission_bandwidth: int = 20,
+  flashes: int = 10,
+  lamp_energy: Literal["low", "high"] = "high",
 ) -> str:
-  """Encode the monochromator endpoint layout with ten flashes and gain 100."""
+  """Encode the monochromator endpoint layout, including gated flash measurements."""
+  validate_fluorescence_settings(
+    gain, dynamic_range, read_from, excitation_bandwidth, emission_bandwidth, flashes, lamp_energy
+  )
   min_row, min_col, max_row, max_col = bounds
   if not (1 <= min_row <= max_row <= 99 and 1 <= min_col <= max_col <= 99):
     raise ValueError("BioTek assay bounds must be ordered and between 1 and 99")
@@ -87,21 +128,33 @@ def encode_fluorescence(
     raise ValueError("A fluorescence delay requires a collection duration")
   header = f"01{min_row:02}{min_col:02}{max_row:02}{max_col:02}0001200100001"
   read_event = "1001000001"
+  path = "5" if read_from == "top" else "4"
+  energy = "2" if lamp_energy == "high" else "0"
+  range_code = "1" if dynamic_range == "extended" else "0"
   optics = (
-    f"35000100200200{excitation_wavelength:04}000{emission_wavelength:04}000"
-    f"00000{delay_microseconds:05}{collection_microseconds:05}21001"
+    f"3{path}0{flashes:04}{excitation_bandwidth:03}{emission_bandwidth:03}0"
+    f"{excitation_wavelength:04}000{emission_wavelength:04}000"
+    f"00000{delay_microseconds:05}{collection_microseconds:05}{energy}{gain:03}{range_code}"
   )
   return encode_assay(header + read_event + optics)
 
 
-def encode_luminescence(bounds: Tuple[int, int, int, int], integration_ticks: int) -> str:
+def encode_luminescence(
+  bounds: Tuple[int, int, int, int],
+  integration_ticks: int,
+  *,
+  gain: int = 135,
+  dynamic_range: Literal["standard", "extended"] = "extended",
+) -> str:
   """Encode the broadband endpoint layout with integration in 20 ms ticks."""
   min_row, min_col, max_row, max_col = bounds
+  validate_detector_settings(gain, dynamic_range)
   if not (1 <= min_row <= max_row <= 99 and 1 <= min_col <= max_col <= 99):
     raise ValueError("BioTek assay bounds must be ordered and between 1 and 99")
   if not 1 <= integration_ticks <= 3000:
     raise ValueError("BioTek luminescence integration must be 1–3000 ticks")
   header = f"01{min_row:02}{min_col:02}{max_row:02}{max_col:02}0001200100001"
   read_event = "1001000001"
-  optics = f"230{integration_ticks:04}0200200-001000-00300000000000000000001351"
+  range_code = "1" if dynamic_range == "extended" else "0"
+  optics = f"230{integration_ticks:04}0200200-001000-0030000000000000000000{gain:03}{range_code}"
   return encode_assay(header + read_event + optics)

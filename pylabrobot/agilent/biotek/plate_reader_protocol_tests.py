@@ -20,6 +20,7 @@ TEST_DATA = Path(__file__).parent / "test_data"
 PACKET_VECTORS = json.loads((TEST_DATA / "absorbance_packets.json").read_text())["vectors"]
 LEGACY_CAPTURE = json.loads((TEST_DATA / "synergy_ht_identity.json").read_text())
 TRF_CAPTURE = json.loads((TEST_DATA / "cytation5_trf_reference.json").read_text())
+BOTTOM_CAPTURE = json.loads((TEST_DATA / "cytation5_bottom_trf_reference.json").read_text())
 SUPPORTED = b"10000000000000000"
 UNSUPPORTED = b"00000000000000000"
 ASSAY_REPLY = b"0350000000000000010000000000490300000\x03"
@@ -86,7 +87,7 @@ def test_invalid_time_resolved_fields(delay: int, collection: int) -> None:
 
 
 def test_captured_cytation_trf_frame() -> None:
-  """Match the vendor capture apart from its automatic gain of 200 versus fixed 100."""
+  """Match the complete captured top-read packet, including gain and checksum."""
   reference = TRF_CAPTURE["packet"]
   packet = encode_fluorescence(
     tuple(TRF_CAPTURE["bounds"]),
@@ -94,16 +95,43 @@ def test_captured_cytation_trf_frame() -> None:
     TRF_CAPTURE["emission_wavelength"],
     TRF_CAPTURE["delay_microseconds"],
     TRF_CAPTURE["collection_microseconds"],
+    gain=TRF_CAPTURE["gain"],
   )
-  assert packet[:-7] == reference[:-7]
-  assert packet[-7:-4] == "100"
-  assert reference[-7:-4] == "200"
-  assert packet[-4] == reference[-4] == "1"
-  assert packet[-3:] == "105"
-  assert reference[-3:] == "106"
+  assert packet == reference
   assert parse_assay_response(bytes.fromhex(TRF_CAPTURE["assay_reply_hex"])) == (
     b"000000000000001000000000000"
   )
+
+
+def test_captured_bottom_trf_frame() -> None:
+  """Match bottom optics, unequal bandwidths, seven low-energy flashes and manual gain."""
+  capture = BOTTOM_CAPTURE
+  packet = encode_fluorescence(
+    tuple(capture["bounds"]),
+    capture["excitation_wavelength"],
+    capture["emission_wavelength"],
+    capture["delay_microseconds"],
+    capture["collection_microseconds"],
+    gain=capture["gain"],
+    dynamic_range=capture["dynamic_range"],
+    read_from=capture["read_from"],
+    excitation_bandwidth=capture["excitation_bandwidth"],
+    emission_bandwidth=capture["emission_bandwidth"],
+    flashes=capture["flashes"],
+    lamp_energy=capture["lamp_energy"],
+  )
+  assert packet == capture["packet"]
+  assert parse_assay_response(bytes.fromhex(capture["assay_reply_hex"])) == (
+    b"000000000000001000000000000"
+  )
+
+
+@pytest.mark.parametrize("gain", [0, 25, 150, 255])
+def test_luminescence_detector_settings(gain: int) -> None:
+  """PMT sensitivity and standard range occupy the shared optical record tail."""
+  packet = encode_luminescence((1, 3, 1, 3), 10, gain=gain, dynamic_range="standard")
+  assert packet[-7:-3] == f"{gain:03}0"
+  assert packet[-3:] == f"{sum(packet[4:-3].encode()) % 256:03}"
 
 
 def test_assay_reply() -> None:
@@ -263,6 +291,77 @@ class TestReaderNegotiation(unittest.IsolatedAsyncioTestCase):
     data = self.reader._parse_body(acquired[6:])
     assert data[0][2] == 1
     assert sum(value is not None for row in data for value in row) == 1
+
+  async def test_bottom_read_skips_top_probe_and_matches_capture(self) -> None:
+    """A bottom read must never position the top fiber, and retains the requested optics."""
+    self.reader._plate = self.plate
+    self.reader.set_plate = AsyncMock()
+    self.reader._temperature_after_read = AsyncMock(return_value=14.2)
+    self.reader.query_capability = AsyncMock(return_value=b"11" + b"0" * 15)
+    self.reader.send_command = AsyncMock(side_effect=[ASSAY_REPLY, b"\x060000\x03"])
+    self.reader._read_until = AsyncMock(
+      return_value=bytes.fromhex(BOTTOM_CAPTURE["acquisition_reply_hex"])[6:]
+    )
+    result = await self.reader._read_fluorescence(
+      self.plate,
+      self.plate["A3"],
+      360,
+      620,
+      6,
+      100,
+      500,
+      gain=150,
+      dynamic_range="standard",
+      read_from="bottom",
+      excitation_bandwidth=10,
+      emission_bandwidth=30,
+      flashes=7,
+      lamp_energy="low",
+    )
+    assert self.reader.send_command.call_args_list == [
+      call("D", BOTTOM_CAPTURE["packet"]),
+      call("O"),
+    ]
+    assert result[0].data[0][2] == 0
+
+  async def test_bandwidth_capability_before_movement(self) -> None:
+    """Reject unsupported or narrower-than-installed slits before configuring the plate."""
+    self.reader.set_plate = AsyncMock()
+    self.reader.send_command = AsyncMock()
+    for capability, bandwidth, error in (
+      (UNSUPPORTED, 10, NotImplementedError),
+      (b"11" + b"0" * 15, 3, ValueError),
+    ):
+      with self.subTest(capability=capability, bandwidth=bandwidth):
+        self.reader.query_capability = AsyncMock(return_value=capability)
+        with pytest.raises(error):
+          await self.reader.read_fluorescence(
+            self.plate, self.plate["A3"], 360, 620, 6, excitation_bandwidth=bandwidth
+          )
+        self.reader.set_plate.assert_not_awaited()
+        self.reader.send_command.assert_not_awaited()
+
+  async def test_invalid_optics_do_not_touch_hardware(self) -> None:
+    """Reject malformed PMT, slit, flash and path settings before any connection use."""
+    for options in (
+      {"gain": 24},
+      {"gain": 256},
+      {"gain": True},
+      {"gain": 100.5},
+      {"dynamic_range": "auto"},
+      {"read_from": "side"},
+      {"excitation_bandwidth": 2},
+      {"emission_bandwidth": 51},
+      {"excitation_bandwidth": 10.5},
+      {"flashes": 0},
+      {"flashes": 256},
+      {"flashes": True},
+      {"lamp_energy": "medium"},
+    ):
+      with self.subTest(options=options):
+        with pytest.raises(ValueError):
+          await self.reader.read_fluorescence(self.plate, self.plate["A3"], 360, 620, 6, **options)
+        self.io.write.assert_not_called()
 
   async def test_invalid_luminescence_time_does_not_touch_hardware(self) -> None:
     """Reject invalid exposures before geometry or focus can move the instrument."""

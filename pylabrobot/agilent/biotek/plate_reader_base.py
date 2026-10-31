@@ -4,7 +4,7 @@ import logging
 import math
 from abc import ABCMeta
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 from pylabrobot.agilent.biotek._reader import BioTekHandshakeError, _BioTekReader
 from pylabrobot.agilent.biotek.plate_reader_protocol import (
@@ -13,6 +13,8 @@ from pylabrobot.agilent.biotek.plate_reader_protocol import (
   encode_luminescence,
   parse_assay_response,
   parse_response,
+  validate_detector_settings,
+  validate_fluorescence_settings,
 )
 from pylabrobot.agilent.biotek.results import (
   AbsorbanceResult as AbsorbanceResult,
@@ -391,6 +393,9 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     wells: List[Well],
     focal_height: float,
     integration_time: float = 1,
+    *,
+    gain: int = 135,
+    dynamic_range: Literal["standard", "extended"] = "extended",
   ) -> List[LuminescenceResult]:
     """Read luminescence.
 
@@ -399,6 +404,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       wells: Wells to read.
       focal_height: Focal height in mm.
       integration_time: Integration time in seconds, from 0.2 to 60 in steps of 0.2.
+      gain: PMT sensitivity, 0 or an integer from 25 to 255.
+      dynamic_range: Standard or extended result range.
     """
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
@@ -409,6 +416,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     if not math.isclose(integration_time * 5, round(integration_time * 5), abs_tol=1e-8):
       raise ValueError("Integration time must be a multiple of 0.2 seconds")
     integration_ticks = round(integration_time * 50)
+    validate_detector_settings(gain, dynamic_range)
 
     async with self._operation():
       logger.info(
@@ -430,6 +438,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         cmd = encode_luminescence(
           bounds=(min_row + 1, min_col + 1, max_row + 1, max_col + 1),
           integration_ticks=integration_ticks,
+          gain=gain,
+          dynamic_range=dynamic_range,
         )
         parse_assay_response(await self.send_command("D", cmd))
 
@@ -466,8 +476,19 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     focal_height: float,
     delay_microseconds: int = 0,
     collection_microseconds: int = 0,
+    *,
+    gain: int = 100,
+    dynamic_range: Literal["standard", "extended"] = "extended",
+    read_from: Literal["top", "bottom"] = "top",
+    excitation_bandwidth: int = 20,
+    emission_bandwidth: int = 20,
+    flashes: int = 10,
+    lamp_energy: Literal["low", "high"] = "high",
   ) -> List[FluorescenceResult]:
     """Execute a monochromator endpoint read with optional hardware-gated timing."""
+    validate_fluorescence_settings(
+      gain, dynamic_range, read_from, excitation_bandwidth, emission_bandwidth, flashes, lamp_energy
+    )
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
       raise ValueError(f"{self.__class__.__name__}: focal height must be within {min_fh}-{max_fh}")
@@ -491,11 +512,19 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         emission_wavelength,
         len(wells),
       )
+      if excitation_bandwidth != 20 or emission_bandwidth != 20:
+        capability = await self.query_capability(2108)
+        if capability[:1] != b"1":
+          raise NotImplementedError("This reader does not support variable monochromator bandwidth")
+        minimum = 3 if capability[1:2] == b"2" else 9
+        if min(excitation_bandwidth, emission_bandwidth) < minimum:
+          raise ValueError(f"This reader requires bandwidths between {minimum} and 50 nm")
       await self.set_plate(plate)
       await self._prepare_plate_read()
 
-      cmd = f"{614220 + int(1000 * focal_height)}\x03"
-      parse_response(await self.send_command("t", cmd), "t")
+      if read_from == "top":
+        cmd = f"{614220 + int(1000 * focal_height)}\x03"
+        parse_response(await self.send_command("t", cmd), "t")
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
@@ -507,6 +536,13 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
           emission_wavelength=emission_wavelength,
           delay_microseconds=delay_microseconds,
           collection_microseconds=collection_microseconds,
+          gain=gain,
+          dynamic_range=dynamic_range,
+          read_from=read_from,
+          excitation_bandwidth=excitation_bandwidth,
+          emission_bandwidth=emission_bandwidth,
+          flashes=flashes,
+          lamp_energy=lamp_energy,
         )
         parse_assay_response(await self.send_command("D", cmd))
 
@@ -542,6 +578,14 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     excitation_wavelength: int,
     emission_wavelength: int,
     focal_height: float,
+    *,
+    gain: int = 100,
+    dynamic_range: Literal["standard", "extended"] = "extended",
+    read_from: Literal["top", "bottom"] = "top",
+    excitation_bandwidth: int = 20,
+    emission_bandwidth: int = 20,
+    flashes: int = 10,
+    lamp_energy: Literal["low", "high"] = "high",
   ) -> List[FluorescenceResult]:
     """Read endpoint fluorescence through the monochromator optical path.
 
@@ -550,10 +594,29 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       wells: Wells to read.
       excitation_wavelength: Excitation wavelength in nm.
       emission_wavelength: Emission wavelength in nm.
-      focal_height: Focal height in mm.
+      focal_height: Top-probe height in mm; ignored for bottom reads.
+      gain: PMT sensitivity, 0 or an integer from 25 to 255. Compare results only
+        with the same gain and range settings.
+      dynamic_range: Standard or extended result range.
+      read_from: Top or bottom monochromator optics.
+      excitation_bandwidth: Excitation bandwidth in nm; 9–50 on this Cytation 5.
+      emission_bandwidth: Emission bandwidth in nm; 9–50 on this Cytation 5.
+      flashes: Excitation flashes per well, from 1 to 255.
+      lamp_energy: Low or high excitation flash energy.
     """
     return await self._read_fluorescence(
-      plate, wells, excitation_wavelength, emission_wavelength, focal_height
+      plate,
+      wells,
+      excitation_wavelength,
+      emission_wavelength,
+      focal_height,
+      gain=gain,
+      dynamic_range=dynamic_range,
+      read_from=read_from,
+      excitation_bandwidth=excitation_bandwidth,
+      emission_bandwidth=emission_bandwidth,
+      flashes=flashes,
+      lamp_energy=lamp_energy,
     )
 
   async def _abort(self) -> None:
