@@ -4,12 +4,14 @@ import json
 import unittest
 from pathlib import Path
 from typing import Optional
-from unittest.mock import call, create_autospec
+from unittest.mock import AsyncMock, call, create_autospec
 
 import pytest
 
 from pylabrobot.agilent.biotek.plate_reader_protocol import (
   encode_absorbance,
+  encode_fluorescence,
+  encode_luminescence,
   parse_assay_response,
   parse_response,
 )
@@ -34,6 +36,32 @@ def test_absorbance_packets(vector: dict) -> None:
     )
     == vector["packet"]
   )
+
+
+@pytest.mark.parametrize(
+  ("excitation", "emission", "checksum"),
+  [(300, 400, "085"), (485, 528, "110")],
+)
+def test_fluorescence_checksum(excitation: int, emission: int, checksum: str) -> None:
+  """The checksum's hundreds digit changes with the wavelengths and well bounds."""
+  packet = encode_fluorescence((1, 1, 1, 1), excitation, emission)
+  assert packet[:4] == "0084"
+  assert len(packet) == 88
+  assert packet[-3:] == checksum
+  assert not packet.endswith("\x03")
+
+
+@pytest.mark.parametrize("ticks", [10, 20, 50, 60, 1000, 3000])
+def test_luminescence_integration_field(ticks: int) -> None:
+  """Twenty-millisecond ticks occupy exactly four digits ahead of both bandwidths."""
+  packet = encode_luminescence((1, 3, 1, 3), ticks)
+  optics = packet[37:-3]
+  assert len(packet) == 88
+  assert optics[:3] == "230"
+  assert int(optics[3:7]) == ticks
+  assert optics[7:14] == "0200200"
+  assert optics[14:28] == "-001000-003000"
+  assert packet[-3:] == f"{sum(packet[4:-3].encode()) % 256:03}"
 
 
 def test_assay_reply() -> None:
@@ -152,6 +180,46 @@ class TestReaderNegotiation(unittest.IsolatedAsyncioTestCase):
         with pytest.raises((ValueError, RuntimeError)):
           await self.reader.read_absorbance(self.plate, self.plate["A1"], 580)
         assert call(b"O") not in self.io.write.call_args_list
+
+  async def test_luminescence_duration_conversion(self) -> None:
+    """Fractional and whole-second durations use the same 20 ms counter."""
+    self.reader._plate = self.plate
+    self.reader.set_plate = AsyncMock()
+    self.reader._temperature_after_read = AsyncMock(return_value=23.7)
+    self.reader._read_until = AsyncMock(
+      return_value=b"01,1,\r000:00:00.0,237,01,01,0000003\r\n237\x1a132\x1a0000\x03"
+    )
+    for duration, ticks in ((0.2, 10), (0.4, 20), (1, 50), (1.2, 60), (20, 1000), (60, 3000)):
+      with self.subTest(duration=duration):
+        self.reader.send_command = AsyncMock(
+          side_effect=[b"0000\x03", ASSAY_REPLY, b"\x060000\x03"]
+        )
+        result = await self.reader.read_luminescence(self.plate, self.plate["A1"], 6, duration)
+        packet = self.reader.send_command.call_args_list[1].args[1]
+        assert packet[40:44] == f"{ticks:04}"
+        assert result[0].data[0][0] == 3
+
+  async def test_optical_assay_error_does_not_start_read(self) -> None:
+    """Fluorescence and luminescence validate D replies before starting acquisition."""
+    self.reader.set_plate = AsyncMock()
+    for mode in ("fluorescence", "luminescence"):
+      for reply in (ASSAY_REPLY[:10] + b"1" + ASSAY_REPLY[11:], b"0A01\x03"):
+        with self.subTest(mode=mode, reply=reply):
+          self.reader.send_command = AsyncMock(side_effect=[b"0000\x03", reply])
+          with pytest.raises((ValueError, RuntimeError)):
+            if mode == "fluorescence":
+              await self.reader.read_fluorescence(self.plate, self.plate["A1"], 300, 400, 6)
+            else:
+              await self.reader.read_luminescence(self.plate, self.plate["A1"], 6, 0.2)
+          assert call("O") not in self.reader.send_command.call_args_list
+
+  async def test_invalid_luminescence_time_does_not_touch_hardware(self) -> None:
+    """Reject invalid exposures before geometry or focus can move the instrument."""
+    for duration in (0, -1, 0.1, 0.3, 60.2, float("nan"), float("inf")):
+      with self.subTest(duration=duration):
+        with pytest.raises(ValueError, match="Integration time"):
+          await self.reader.read_luminescence(self.plate, self.plate["A1"], 6, duration)
+        self.io.write.assert_not_called()
 
   async def test_capability_cache_resets_on_connection(self) -> None:
     """A reconnect may have a different capability set."""

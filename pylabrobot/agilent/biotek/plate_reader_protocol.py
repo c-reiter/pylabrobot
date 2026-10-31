@@ -1,4 +1,4 @@
-"""Framing and endpoint absorbance records for the BioTek RDOP22 protocol."""
+"""Framing and endpoint assay records for the BioTek RDOP22 protocol."""
 
 from typing import Optional, Tuple
 
@@ -63,4 +63,36 @@ def encode_absorbance(
   read_event = "1001000001"
   optics = "0" + ("6" if extended_optics else "") + "00008"
   optics += ("000" if extra_read_field else "") + f"{wavelength:04}"
+  return encode_assay(header + read_event + optics)
+
+
+def encode_fluorescence(
+  bounds: Tuple[int, int, int, int],
+  excitation_wavelength: int,
+  emission_wavelength: int,
+) -> str:
+  """Encode the monochromator endpoint layout with ten flashes and gain 100."""
+  min_row, min_col, max_row, max_col = bounds
+  if not (1 <= min_row <= max_row <= 99 and 1 <= min_col <= max_col <= 99):
+    raise ValueError("BioTek assay bounds must be ordered and between 1 and 99")
+  if not (1 <= excitation_wavelength <= 9999 and 1 <= emission_wavelength <= 9999):
+    raise ValueError("BioTek wavelengths must fit four decimal digits")
+  header = f"01{min_row:02}{min_col:02}{max_row:02}{max_col:02}0001200100001"
+  read_event = "1001000001"
+  optics = (
+    f"35000100200200{excitation_wavelength:04}000{emission_wavelength:04}00000000000000000021001"
+  )
+  return encode_assay(header + read_event + optics)
+
+
+def encode_luminescence(bounds: Tuple[int, int, int, int], integration_ticks: int) -> str:
+  """Encode the broadband endpoint layout with integration in 20 ms ticks."""
+  min_row, min_col, max_row, max_col = bounds
+  if not (1 <= min_row <= max_row <= 99 and 1 <= min_col <= max_col <= 99):
+    raise ValueError("BioTek assay bounds must be ordered and between 1 and 99")
+  if not 1 <= integration_ticks <= 3000:
+    raise ValueError("BioTek luminescence integration must be 1–3000 ticks")
+  header = f"01{min_row:02}{min_col:02}{max_row:02}{max_col:02}0001200100001"
+  read_event = "1001000001"
+  optics = f"230{integration_ticks:04}0200200-001000-00300000000000000000001351"
   return encode_assay(header + read_event + optics)

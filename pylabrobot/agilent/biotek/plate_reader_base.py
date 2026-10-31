@@ -1,6 +1,7 @@
 import asyncio
 import enum
 import logging
+import math
 from abc import ABCMeta
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -8,6 +9,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from pylabrobot.agilent.biotek._reader import BioTekHandshakeError, _BioTekReader
 from pylabrobot.agilent.biotek.plate_reader_protocol import (
   encode_absorbance,
+  encode_fluorescence,
+  encode_luminescence,
   parse_assay_response,
   parse_response,
 )
@@ -395,11 +398,17 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       plate: Plate to read.
       wells: Wells to read.
       focal_height: Focal height in mm.
-      integration_time: Integration time in seconds.
+      integration_time: Integration time in seconds, from 0.2 to 60 in steps of 0.2.
     """
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
       raise ValueError(f"{self.__class__.__name__}: focal height must be within {min_fh}-{max_fh}")
+
+    if not math.isfinite(integration_time) or not 0.2 <= integration_time <= 60:
+      raise ValueError("Integration time must be between 0.2 and 60 seconds")
+    if not math.isclose(integration_time * 5, round(integration_time * 5), abs_tol=1e-8):
+      raise ValueError("Integration time must be a multiple of 0.2 seconds")
+    integration_ticks = round(integration_time * 50)
 
     async with self._operation():
       logger.info(
@@ -412,32 +421,24 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       await self._prepare_plate_read()
 
       cmd = f"3{14220 + int(1000 * focal_height)}\x03"
-      await self.send_command("t", cmd)
-
-      integration_time_seconds = int(integration_time)
-      assert 0 <= integration_time_seconds <= 60, (
-        "Integration time seconds must be between 0 and 60"
-      )
-      integration_time_milliseconds = integration_time - int(integration_time)
-      assert round(integration_time_milliseconds * 10) % 2 == 0, (
-        "Integration time milliseconds must be a multiple of 0.2"
-      )
-      integration_time_seconds_s = str(integration_time_seconds * 5).zfill(2)
-      integration_time_milliseconds_s = str(int(float(integration_time_milliseconds * 50))).zfill(2)
+      parse_response(await self.send_command("t", cmd), "t")
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
       ]
       for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
-        cmd = f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}000120010000110010000012300{integration_time_seconds_s}{integration_time_milliseconds_s}200200-001000-003000000000000000000013510"
-        checksum = str((sum(cmd.encode()) + 8) % 100).zfill(2)
-        cmd = cmd + checksum
-        await self.send_command("D", cmd)
+        cmd = encode_luminescence(
+          bounds=(min_row + 1, min_col + 1, max_row + 1, max_col + 1),
+          integration_ticks=integration_ticks,
+        )
+        parse_assay_response(await self.send_command("D", cmd))
 
         resp = await self.send_command("O")
-        assert resp == b"\x060000\x03"
+        parse_response(resp, "O")
+        if resp != b"\x060000\x03":
+          raise ValueError(f"BioTek O: expected ACK and status, received {resp!r}")
 
-        timeout = 60 + integration_time_seconds * (2 * 60 + 10)
+        timeout = 60 + integration_time * (2 * 60 + 10)
         body = await self._read_until(b"\x03", timeout=timeout)
         assert body is not None
         parsed_data = self._parse_body(body)
@@ -464,6 +465,15 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     emission_wavelength: int,
     focal_height: float,
   ) -> List[FluorescenceResult]:
+    """Read endpoint fluorescence through the monochromator optical path.
+
+    Args:
+      plate: Plate to read.
+      wells: Wells to read.
+      excitation_wavelength: Excitation wavelength in nm.
+      emission_wavelength: Emission wavelength in nm.
+      focal_height: Focal height in mm.
+    """
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
       raise ValueError(f"{self.__class__.__name__}: focal height must be within {min_fh}-{max_fh}")
@@ -491,25 +501,23 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       await self._prepare_plate_read()
 
       cmd = f"{614220 + int(1000 * focal_height)}\x03"
-      await self.send_command("t", cmd)
-
-      excitation_wavelength_str = str(excitation_wavelength).zfill(4)
-      emission_wavelength_str = str(emission_wavelength).zfill(4)
+      parse_response(await self.send_command("t", cmd), "t")
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
       ]
       for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
-        cmd = (
-          f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}0001200100001100100000135000100200200{excitation_wavelength_str}000"
-          f"{emission_wavelength_str}000000000000000000210011"
+        cmd = encode_fluorescence(
+          bounds=(min_row + 1, min_col + 1, max_row + 1, max_col + 1),
+          excitation_wavelength=excitation_wavelength,
+          emission_wavelength=emission_wavelength,
         )
-        checksum = str((sum(cmd.encode()) + 7) % 100).zfill(2)
-        cmd = cmd + checksum + "\x03"
-        await self.send_command("D", cmd)
+        parse_assay_response(await self.send_command("D", cmd))
 
         resp = await self.send_command("O")
-        assert resp == b"\x060000\x03"
+        parse_response(resp, "O")
+        if resp != b"\x060000\x03":
+          raise ValueError(f"BioTek O: expected ACK and status, received {resp!r}")
 
         body = await self._read_until(b"\x03", timeout=60 * 2)
         assert body is not None
