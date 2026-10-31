@@ -1,4 +1,4 @@
-"""Standalone BlackFly camera driver using Aravis (GenICam/USB3 Vision).
+"""Cytation camera driver using Aravis (GenICam/USB3 Vision).
 
 Standalone: no PLR dependencies except numpy. ``CytationMicroscope`` delegates camera
 operations here; Aravis (via PyGObject) talks to the camera over USB3 Vision/GenICam.
@@ -59,7 +59,7 @@ class CameraInfo:
 
 
 class AravisCamera:
-  """BlackFly camera driver using Aravis for GenICam access over USB3 Vision.
+  """Cytation camera access through the vendor-independent USB3 Vision protocol.
 
   This class wraps all Aravis/GenICam operations for single-frame image
   acquisition with software triggering.
@@ -83,7 +83,7 @@ class AravisCamera:
     camera = AravisCamera()
     await camera.setup("12345678")
     await camera.set_exposure(10.0)  # 10 ms
-    image = await camera.trigger()    # numpy array, Mono8
+    image = await camera.trigger()    # numpy array, camera's monochrome format
     await camera.stop()
   """
 
@@ -96,6 +96,7 @@ class AravisCamera:
     self._width: int = 0
     self._height: int = 0
     self._payload_size: int = 0
+    self._capture_lock = asyncio.Lock()
 
   @property
   def width(self) -> int:
@@ -188,12 +189,10 @@ class AravisCamera:
 
     self._device = self.camera.get_device()
 
-    # Configure software trigger mode.
-    # GenICam nodes: TriggerSelector, TriggerSource, TriggerMode are
-    # standard SFNC (Standard Features Naming Convention) names.
-    self.device.set_string_feature_value("TriggerSelector", "FrameStart")
-    self.device.set_string_feature_value("TriggerSource", "Software")
-    self.device.set_string_feature_value("TriggerMode", "On")
+    # Aravis disables other trigger selectors and configures the appropriate edge
+    # and frame-rate settings for the camera model.
+    self.camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+    self.camera.set_trigger("Software")
 
     # Read image dimensions and payload size from camera.
     self._width = self.camera.get_region()[2]  # x, y, width, height
@@ -253,35 +252,57 @@ class AravisCamera:
             Default 5000 (5 seconds).
 
     Returns:
-        numpy.ndarray: Image as 2D uint8 array (height × width), Mono8 format.
+        numpy.ndarray: Image as a 2D array (height × width). Mono8 returns uint8;
+            unpacked Mono10, Mono12, and Mono16 return uint16.
 
     Raises:
-        RuntimeError: If camera not initialized, not acquiring, or times out.
+        RuntimeError: If the camera is not acquiring or a frame is incomplete.
+        TimeoutError: If no frame arrives before the deadline.
     """
     _ = self.camera
     if not self._acquiring:
       raise RuntimeError("Camera is not acquiring. Call start_acquisition() first.")
 
-    # Send software trigger command.
-    self.device.execute_command("TriggerSoftware")
-
-    # Pop the filled buffer from the stream.
-    # timeout_pop_buffer takes microseconds, so convert from ms.
-    buffer = self.stream.timeout_pop_buffer(timeout_ms * 1000)
-    if buffer is None:
-      raise RuntimeError(
-        f"Camera capture timed out after {timeout_ms}ms. "
-        "Is the camera connected and trigger mode configured?"
-      )
-
-    # Extract image data and copy to numpy array.
-    data = buffer.get_data()
-    image = np.frombuffer(data, dtype=np.uint8).reshape(self._height, self._width).copy()
-
-    # Return buffer to pool for reuse.
-    self.stream.push_buffer(buffer)
-
-    return image
+    if timeout_ms <= 0:
+      raise ValueError("timeout_ms must be positive")
+    async with self._capture_lock:
+      stream = self.stream
+      self.camera.software_trigger()
+      pending = asyncio.create_task(asyncio.to_thread(stream.timeout_pop_buffer, timeout_ms * 1000))
+      try:
+        buffer = await asyncio.shield(pending)
+      except asyncio.CancelledError:
+        buffer = await pending
+        if buffer is not None:
+          stream.push_buffer(buffer)
+        raise
+      if buffer is None:
+        raise TimeoutError(f"Camera capture timed out after {timeout_ms}ms")
+      try:
+        if buffer.get_status() != Aravis.BufferStatus.SUCCESS:
+          raise RuntimeError(f"Camera returned an incomplete frame: {buffer.get_status()}")
+        pixel_format = buffer.get_image_pixel_format()
+        # PFNC unpacked monochrome formats. Mono10/12 occupy 16 bits per pixel.
+        formats = {
+          0x01080001: "u1",
+          0x01100003: "<u2",
+          0x01100005: "<u2",
+          0x01100007: "<u2",
+        }
+        if pixel_format not in formats:
+          raise NotImplementedError(f"Unsupported camera pixel format: 0x{pixel_format:08x}")
+        dtype = np.dtype(formats[pixel_format])
+        width, height = buffer.get_image_width(), buffer.get_image_height()
+        padding_x, _ = buffer.get_image_padding()
+        stride = width * dtype.itemsize + padding_x
+        data = buffer.get_image_data()
+        if len(data) < height * stride:
+          raise RuntimeError("Camera image payload is shorter than its dimensions")
+        return np.ndarray(
+          (height, width), dtype=dtype, buffer=data, strides=(stride, dtype.itemsize)
+        ).copy()
+      finally:
+        stream.push_buffer(buffer)
 
   async def stop(self) -> None:
     """Release camera and free all Aravis resources.
@@ -384,12 +405,20 @@ class AravisCamera:
         fmt: Aravis pixel format constant. If None, uses Mono8.
     """
     camera = self.camera
+    if self._acquiring:
+      raise RuntimeError("Stop acquisition before changing the pixel format")
     if fmt is None:
       if HAS_ARAVIS:
         fmt = Aravis.PIXEL_FORMAT_MONO_8
       else:
         return
     camera.set_pixel_format(fmt)
+    self._width, self._height = camera.get_region()[2:]
+    self._payload_size = camera.get_payload()
+    self._stream = None
+    self._stream = camera.create_stream(None, None)
+    for _ in range(_BUFFER_COUNT):
+      self.stream.push_buffer(Aravis.Buffer.new_allocate(self._payload_size))
 
   def get_device_info(self) -> CameraInfo:
     """Read camera identification from GenICam nodes.
