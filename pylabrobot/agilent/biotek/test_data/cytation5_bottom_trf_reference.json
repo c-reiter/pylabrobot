@@ -1,0 +1,24 @@
+{
+  "model": "Cytation 5",
+  "firmware": "1.12",
+  "bounds": [
+    1,
+    3,
+    1,
+    3
+  ],
+  "excitation_wavelength": 360,
+  "emission_wavelength": 620,
+  "delay_microseconds": 100,
+  "collection_microseconds": 500,
+  "gain": 150,
+  "dynamic_range": "standard",
+  "read_from": "bottom",
+  "excitation_bandwidth": 10,
+  "emission_bandwidth": 30,
+  "flashes": 7,
+  "lamp_energy": "low",
+  "packet": "0084010103010300012001000011001000001340000701003000360000062000000000001000050001500112",
+  "assay_reply_hex": "3033353030303030303030303030303030313030303030303030303030303031373030303003",
+  "acquisition_reply_hex": "06303030300330312c312c0d3030303a30303a30302e302c3134322c30312c30332c303030303030300d0a3134321a3036391a3030303003"
+}

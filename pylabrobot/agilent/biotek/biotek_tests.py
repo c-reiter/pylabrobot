@@ -288,13 +288,13 @@ class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
 
     self.backend.io.write.assert_any_call(b"D")
     self.backend.io.write.assert_any_call(
-      b"008401010107010001200100001100100000123000020200200-001000-00300000000000000000001351086"
+      b"008401010107010001200100001100100000123000200200200-001000-00300000000000000000001351086"
     )
     self.backend.io.write.assert_any_call(
-      b"008401020207030001200100001100100000123000020200200-001000-00300000000000000000001351090"
+      b"008401020207030001200100001100100000123000200200200-001000-00300000000000000000001351090"
     )
     self.backend.io.write.assert_any_call(
-      b"008401040406040001200100001100100000123000020200200-001000-00300000000000000000001351094"
+      b"008401040406040001200100001100100000123000200200200-001000-00300000000000000000001351094"
     )
     self.backend.io.write.assert_any_call(b"O")
 
@@ -359,7 +359,6 @@ class TestCytation5Backend(unittest.IsolatedAsyncioTestCase):
     self.backend.io.write.assert_any_call(b"D")
     self.backend.io.write.assert_any_call(
       b"0084010101081200012001000011001000001350001002002000485000052800000000000000000021001119"
-      b"\x03"
     )
     self.backend.io.write.assert_any_call(b"O")
 
@@ -601,6 +600,18 @@ class TestSharedBioTekReader(unittest.IsolatedAsyncioTestCase):
       await reader.open()
     reader.io.stop.assert_awaited_once()
 
+  async def test_baud_fallback_accepts_garbled_acknowledgement(self):
+    """A controller left at 38400 baud can return 0xF8 when opened at 9600."""
+    reader = self.make_reader(BioTekPlateReaderDriver)
+    reader.io.read.side_effect = [
+      b"\xf8",
+      *_byte_iter("\x061320200  Version 1.12   0000\x03"),
+    ]
+    await reader.setup()
+    self.assertEqual(reader.version, "1.12")
+    reader.io.set_baudrate.assert_awaited_with(38_461)
+    reader.io.stop.assert_not_awaited()
+
   async def test_synergy_h1_retries_without_discarding_the_following_frame(self):
     from pylibftdi import FtdiError
 
@@ -668,8 +679,23 @@ class TestSharedBioTekReader(unittest.IsolatedAsyncioTestCase):
 
   async def test_background_shaking_can_be_stopped_with_the_shared_lock(self):
     reader = self.make_reader(BioTekPlateReaderDriver)
-    reader.io.read.side_effect = _byte_iter("\x060000\x03" * 2)
+    reader.io.read.side_effect = _byte_iter("\x060000\x03" * 2 + "\x100000\x03")
     await asyncio.wait_for(reader.shake(reader.ShakeType.ORBITAL, 3), 1)
     await asyncio.wait_for(reader.stop(), 1)
     self.assertEqual(reader.io.write.call_args.args[0], b"x")
     reader.io.stop.assert_awaited_once()
+
+  async def test_shaking_startup_failure_reaches_caller(self):
+    reader = self.make_reader(BioTekPlateReaderDriver)
+    reader.io.read.side_effect = _byte_iter("\x062102\x03")
+    with self.assertRaises(RuntimeError):
+      await asyncio.wait_for(reader.shake(reader.ShakeType.ORBITAL, 3), 1)
+    self.assertFalse(reader._shaking)
+    self.assertIsNone(reader._shaking_task)
+
+  async def test_invalid_shaking_speed_does_not_start_hardware(self):
+    reader = self.make_reader(BioTekPlateReaderDriver)
+    for frequency in (0, 7, True, 2.5):
+      with self.assertRaises(ValueError):
+        await reader.shake(reader.ShakeType.ORBITAL, frequency)
+    reader.io.write.assert_not_called()

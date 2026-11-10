@@ -49,8 +49,12 @@ class LuminescenceResult:
     data: 2D array indexed [row][col]. ``None`` for unmeasured wells.
     temperature: Temperature in °C, or ``None`` if not available.
     timestamp: When the measurement was taken.
+    emission_wavelength: Selected wavelength in nm, or None for broadband light.
+    emission_bandwidth: Monochromator bandwidth in nm, or None for broadband light.
   """
 
   data: List[List[Optional[float]]]
   temperature: Optional[float]
   timestamp: datetime
+  emission_wavelength: Optional[int] = None
+  emission_bandwidth: Optional[int] = None

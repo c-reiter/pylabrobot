@@ -4,25 +4,58 @@ import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, Optional, Union
 
 from pylabrobot.io.ftdi import FTDI
+from pylabrobot.io.serial import Serial
 
 logger = logging.getLogger(__name__)
+
+
+class BioTekHandshakeError(RuntimeError):
+  """A response lacks the command acknowledgement, possibly due to a baud mismatch."""
+
+
+class BioTekError(RuntimeError):
+  """A complete instrument response containing a nonzero firmware status."""
+
+  def __init__(self, code: int, command: Optional[str] = None) -> None:
+    self.code = code
+    self.command = command
+    prefix = f"BioTek {command}: " if command is not None else ""
+    super().__init__(f"{prefix}BioTek reported error 0x{code:04X}")
 
 
 class _BioTekReader:
   """Shared BioTek reader behavior, independent of the assay protocol.
 
   The connection lock covers complete operations, including asynchronous results.
-  Model classes supply initialization and assay formats. FTDI owns connection state.
+  Model classes supply initialization and assay formats. The transport owns connection state.
   """
 
   def __init__(
-    self, timeout: float, device_id: Optional[str], human_readable_device_name: str
+    self,
+    timeout: float,
+    device_id: Optional[str],
+    human_readable_device_name: str,
+    port: Optional[str] = None,
   ) -> None:
     self.timeout = timeout
-    self.io = FTDI(device_id=device_id, human_readable_device_name=human_readable_device_name)
+    if port is not None and device_id is not None:
+      raise ValueError("Specify either a serial port or an FTDI device_id, not both")
+    self.io: Union[FTDI, Serial]
+    if port is None:
+      self.io = FTDI(device_id=device_id, human_readable_device_name=human_readable_device_name)
+    else:
+      self.io = Serial(
+        port=port,
+        human_readable_device_name=human_readable_device_name,
+        baudrate=9600,
+        stopbits=2,
+        rtscts=True,
+        timeout=0.05,
+        write_timeout=timeout,
+      )
     self._lock: Optional[asyncio.Lock] = None
     self._operation_owner: Optional[asyncio.Task] = None
     self._basecode: Optional[str] = None
@@ -87,6 +120,8 @@ class _BioTekReader:
 
   async def _configure_serial(self) -> None:
     """Configure the common BioTek 9600-baud, 8N2, RTS/CTS connection settings."""
+    if isinstance(self.io, Serial):
+      return  # Serial applies the connection settings when opening the port.
     await self.io.set_latency_timer(16)
     await self.io.set_baudrate(9600)
     await self.io.set_line_property(8, 2, 0)
@@ -102,7 +137,7 @@ class _BioTekReader:
     if re.fullmatch(rb"[0-9a-fA-F]{4}\x03", status) is None:
       raise ValueError(f"Malformed BioTek status: {status!r}")
     if int(status[:4], 16):
-      raise RuntimeError(f"BioTek reported error 0x{status[:4].decode('ascii')}")
+      raise BioTekError(int(status[:4], 16))
 
   async def _read_chunk(self, length: int) -> bytes:
     """Read at most length bytes through the PLR transport."""
@@ -142,6 +177,9 @@ class _BioTekReader:
 
   async def _write(self, data: bytes) -> None:
     """Send a complete frame, rejecting partial writes."""
+    if isinstance(self.io, Serial):
+      await self.io.write(data)
+      return
     if await self.io.write(data) != len(data):
       raise IOError("Incomplete BioTek command write")
 
@@ -159,7 +197,7 @@ class _BioTekReader:
       return None
     ack = await self._read_exactly(1)
     if ack != b"\x06":
-      raise RuntimeError(f"BioTek {command!r}: expected ACK, received {ack!r}")
+      raise BioTekHandshakeError(f"BioTek {command!r}: expected ACK, received {ack!r}")
     if parameters is not None:
       await self._write(parameters)
     if not wait_for_response:
@@ -170,8 +208,8 @@ class _BioTekReader:
       response = await self._read_exactly(data_length + 5)
     try:
       self._check_status(response[-5:])
-    except RuntimeError as exc:
-      raise RuntimeError(f"BioTek {command.decode('ascii')}: {exc}") from exc
+    except BioTekError as exc:
+      raise BioTekError(exc.code, command.decode("ascii")) from exc
     return ack + response if parameters is None else response
 
   async def _command(

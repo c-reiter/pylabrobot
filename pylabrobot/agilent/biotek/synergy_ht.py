@@ -9,6 +9,7 @@ from typing import List, Literal, Optional, Sequence, Tuple
 
 from pylabrobot.agilent.biotek._reader import _BioTekReader
 from pylabrobot.agilent.biotek.results import AbsorbanceResult
+from pylabrobot.io.ftdi import FTDI
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class SynergyHT(_BioTekReader):
 
   async def _configure_serial(self) -> None:
     """Apply the legacy reader's DTR and initial buffer settings."""
+    assert isinstance(self.io, FTDI)
     await super()._configure_serial()
     await self.io.set_dtr(False)
     await self.io.usb_purge_rx_buffer()

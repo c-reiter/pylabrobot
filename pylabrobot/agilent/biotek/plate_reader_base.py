@@ -1,15 +1,20 @@
 import asyncio
 import enum
 import logging
+import math
 from abc import ABCMeta
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
-from pylabrobot.agilent.biotek._reader import _BioTekReader
+from pylabrobot.agilent.biotek._reader import BioTekHandshakeError, _BioTekReader
 from pylabrobot.agilent.biotek.plate_reader_protocol import (
   encode_absorbance,
+  encode_fluorescence,
+  encode_luminescence,
   parse_assay_response,
   parse_response,
+  validate_detector_settings,
+  validate_fluorescence_settings,
 )
 from pylabrobot.agilent.biotek.results import (
   AbsorbanceResult as AbsorbanceResult,
@@ -20,6 +25,7 @@ from pylabrobot.agilent.biotek.results import (
 from pylabrobot.agilent.biotek.results import (
   LuminescenceResult as LuminescenceResult,
 )
+from pylabrobot.io.serial import Serial
 from pylabrobot.resources import Plate, Well
 
 logger = logging.getLogger(__name__)
@@ -33,8 +39,9 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     timeout: float = 20,
     device_id: Optional[str] = None,
     human_readable_device_name: str = "Agilent BioTek",
+    port: Optional[str] = None,
   ) -> None:
-    super().__init__(timeout, device_id, human_readable_device_name)
+    super().__init__(timeout, device_id, human_readable_device_name, port=port)
 
     self._plate: Optional[Plate] = None
     self._shaking = False
@@ -75,15 +82,21 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
 
   async def _configure_serial(self) -> None:
     """Reset the adapter before applying the RDOP22 readers' serial settings."""
-    await self.io.usb_reset()
+    if not isinstance(self.io, Serial):
+      await self.io.usb_reset()
     await super()._configure_serial()
 
   async def _initialize_reader(self) -> None:
     """Identify the reader, retrying at the alternate supported baud rate."""
     try:
       await super()._initialize_reader()
-    except TimeoutError:
-      await self.io.set_baudrate(38_461)
+    except (TimeoutError, BioTekHandshakeError):
+      if isinstance(self.io, Serial):
+        await self.io.stop()
+        self.io.baudrate = 38_461
+        await self.io.setup()
+      else:
+        await self.io.set_baudrate(38_461)
       await super()._initialize_reader()
 
   @property
@@ -123,6 +136,10 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
   async def _purge_buffers(self) -> None:
     """Clear pending adapter data before an RDOP22 command."""
     self._receive_buffer.clear()
+    if isinstance(self.io, Serial):
+      await self.io.reset_input_buffer()
+      await self.io.reset_output_buffer()
+      return
     for _ in range(6):
       await self.io.usb_purge_rx_buffer()
     await self.io.usb_purge_tx_buffer()
@@ -180,7 +197,8 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         await self.set_plate(plate)
       await super().close()
 
-  async def home(self):
+  async def home(self) -> Optional[bytes]:
+    """Home the reader axes through the imager-controller command."""
     return await self.send_command("i", "x")
 
   async def set_temperature(self, temperature: float):
@@ -237,10 +255,10 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       result[row_idx][col_idx] = value
     return result
 
-  async def set_plate(self, plate: Plate):
+  async def set_plate(self, plate: Plate) -> Optional[bytes]:
     async with self._operation():
       if plate is self._plate:
-        return
+        return None
       await self._require_rdop22()
 
       rows = plate.num_items_y
@@ -277,7 +295,7 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         "\x03"
       )
 
-      resp = await self.send_command("y", cmd, timeout=1)
+      resp = await self.send_command("y", cmd, timeout=20)
       parse_response(resp, "y")
       self._plate = plate
       return resp
@@ -297,6 +315,9 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     except TimeoutError:
       await self._disconnect()
       return None
+
+  async def _prepare_plate_read(self) -> None:
+    """Allow an integrated microscope to release optics before a plate-reader assay."""
 
   async def read_absorbance(
     self,
@@ -321,12 +342,13 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
 
       logger.info(
         "[BioTek %s] read_absorbance: plate=%s, wavelength=%dnm, wells=%d",
-        self.io.device_id,
+        self.io.port if isinstance(self.io, Serial) else self.io.device_id,
         plate.name,
         wavelength,
         len(wells),
       )
       await self.set_plate(plate)
+      await self._prepare_plate_read()
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
@@ -365,12 +387,28 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         )
       ]
 
+  async def _validate_bandwidths(self, excitation: int, emission: int) -> None:
+    """Check non-default slit widths against the reader's installed monochromators."""
+    if excitation == 20 and emission == 20:
+      return
+    capability = await self.query_capability(2108)
+    if capability[:1] != b"1":
+      raise NotImplementedError("This reader does not support variable monochromator bandwidth")
+    minimum = 3 if capability[1:2] == b"2" else 9
+    if min(excitation, emission) < minimum:
+      raise ValueError(f"This reader requires bandwidths between {minimum} and 50 nm")
+
   async def read_luminescence(
     self,
     plate: Plate,
     wells: List[Well],
     focal_height: float,
     integration_time: float = 1,
+    *,
+    gain: int = 135,
+    dynamic_range: Literal["standard", "extended"] = "extended",
+    emission_wavelength: Optional[int] = None,
+    emission_bandwidth: int = 20,
   ) -> List[LuminescenceResult]:
     """Read luminescence.
 
@@ -378,48 +416,68 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
       plate: Plate to read.
       wells: Wells to read.
       focal_height: Focal height in mm.
-      integration_time: Integration time in seconds.
+      integration_time: Integration time in seconds, from 0.2 to 60 in steps of 0.2.
+      gain: PMT sensitivity, 0 or an integer from 25 to 255.
+      dynamic_range: Standard or extended result range.
+      emission_wavelength: Emission wavelength in nm, or None for broadband light.
+        Selecting a wavelength uses the top emission monochromator.
+      emission_bandwidth: Monochromator bandwidth in nm, 9–50 on this Cytation 5.
+        Only applies when emission_wavelength is selected.
     """
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
       raise ValueError(f"{self.__class__.__name__}: focal height must be within {min_fh}-{max_fh}")
 
+    if not math.isfinite(integration_time) or not 0.2 <= integration_time <= 60:
+      raise ValueError("Integration time must be between 0.2 and 60 seconds")
+    if not math.isclose(integration_time * 5, round(integration_time * 5), abs_tol=1e-8):
+      raise ValueError("Integration time must be a multiple of 0.2 seconds")
+    integration_ticks = round(integration_time * 50)
+    validate_detector_settings(gain, dynamic_range)
+    if emission_wavelength is not None:
+      lower, upper = self.emission_range
+      if type(emission_wavelength) is not int or not lower <= emission_wavelength <= upper:
+        raise ValueError(f"Emission wavelength must be an integer between {lower} and {upper} nm")
+    if type(emission_bandwidth) is not int or not 3 <= emission_bandwidth <= 50:
+      raise ValueError("Emission bandwidth must be an integer between 3 and 50 nm")
+    if emission_wavelength is None and emission_bandwidth != 20:
+      raise ValueError("Emission bandwidth requires a selected emission wavelength")
+
     async with self._operation():
       logger.info(
         "[BioTek %s] read_luminescence: plate=%s, wells=%d",
-        self.io.device_id,
+        self.io.port if isinstance(self.io, Serial) else self.io.device_id,
         plate.name,
         len(wells),
       )
+      await self._validate_bandwidths(20, emission_bandwidth)
       await self.set_plate(plate)
+      await self._prepare_plate_read()
 
-      cmd = f"3{14220 + int(1000 * focal_height)}\x03"
-      await self.send_command("t", cmd)
-
-      integration_time_seconds = int(integration_time)
-      assert 0 <= integration_time_seconds <= 60, (
-        "Integration time seconds must be between 0 and 60"
-      )
-      integration_time_milliseconds = integration_time - int(integration_time)
-      assert round(integration_time_milliseconds * 10) % 2 == 0, (
-        "Integration time milliseconds must be a multiple of 0.2"
-      )
-      integration_time_seconds_s = str(integration_time_seconds * 5).zfill(2)
-      integration_time_milliseconds_s = str(int(float(integration_time_milliseconds * 50))).zfill(2)
+      probe = "3" if emission_wavelength is None else "6"
+      cmd = f"{probe}{14220 + int(1000 * focal_height)}\x03"
+      parse_response(await self.send_command("t", cmd), "t")
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
       ]
       for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
-        cmd = f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}000120010000110010000012300{integration_time_seconds_s}{integration_time_milliseconds_s}200200-001000-003000000000000000000013510"
-        checksum = str((sum(cmd.encode()) + 8) % 100).zfill(2)
-        cmd = cmd + checksum
-        await self.send_command("D", cmd)
+        cmd = encode_luminescence(
+          bounds=(min_row + 1, min_col + 1, max_row + 1, max_col + 1),
+          integration_ticks=integration_ticks,
+          gain=gain,
+          dynamic_range=dynamic_range,
+          emission_wavelength=emission_wavelength,
+          emission_bandwidth=emission_bandwidth,
+        )
+        parse_assay_response(await self.send_command("D", cmd))
 
         resp = await self.send_command("O")
-        assert resp == b"\x060000\x03"
+        parse_response(resp, "O")
+        if resp != b"\x060000\x03":
+          raise ValueError(f"BioTek O: expected ACK and status, received {resp!r}")
 
-        timeout = 60 + integration_time_seconds * (2 * 60 + 10)
+        timeout = 60 + integration_time * (2 * 60 + 10)
         body = await self._read_until(b"\x03", timeout=timeout)
         assert body is not None
         parsed_data = self._parse_body(body)
@@ -435,17 +493,33 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
           data=all_data,
           temperature=temp,
           timestamp=datetime.now(),
+          emission_wavelength=emission_wavelength,
+          emission_bandwidth=emission_bandwidth if emission_wavelength is not None else None,
         )
       ]
 
-  async def read_fluorescence(
+  async def _read_fluorescence(
     self,
     plate: Plate,
     wells: List[Well],
     excitation_wavelength: int,
     emission_wavelength: int,
     focal_height: float,
+    delay_microseconds: int = 0,
+    collection_microseconds: int = 0,
+    *,
+    gain: int = 100,
+    dynamic_range: Literal["standard", "extended"] = "extended",
+    read_from: Literal["top", "bottom"] = "top",
+    excitation_bandwidth: int = 20,
+    emission_bandwidth: int = 20,
+    flashes: int = 10,
+    lamp_energy: Literal["low", "high"] = "high",
   ) -> List[FluorescenceResult]:
+    """Execute a monochromator endpoint read with optional hardware-gated timing."""
+    validate_fluorescence_settings(
+      gain, dynamic_range, read_from, excitation_bandwidth, emission_bandwidth, flashes, lamp_energy
+    )
     min_fh, max_fh = self.focal_height_range
     if not (min_fh <= focal_height <= max_fh):
       raise ValueError(f"{self.__class__.__name__}: focal height must be within {min_fh}-{max_fh}")
@@ -463,36 +537,50 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
     async with self._operation():
       logger.info(
         "[BioTek %s] read_fluorescence: plate=%s, excitation=%dnm, emission=%dnm, wells=%d",
-        self.io.device_id,
+        self.io.port if isinstance(self.io, Serial) else self.io.device_id,
         plate.name,
         excitation_wavelength,
         emission_wavelength,
         len(wells),
       )
+      await self._validate_bandwidths(excitation_bandwidth, emission_bandwidth)
       await self.set_plate(plate)
+      await self._prepare_plate_read()
 
-      cmd = f"{614220 + int(1000 * focal_height)}\x03"
-      await self.send_command("t", cmd)
-
-      excitation_wavelength_str = str(excitation_wavelength).zfill(4)
-      emission_wavelength_str = str(emission_wavelength).zfill(4)
+      if read_from == "top":
+        cmd = f"{614220 + int(1000 * focal_height)}\x03"
+        parse_response(await self.send_command("t", cmd), "t")
 
       all_data: List[List[Optional[float]]] = [
         [None for _ in range(plate.num_items_x)] for _ in range(plate.num_items_y)
       ]
       for min_row, min_col, max_row, max_col in self._get_min_max_row_col_tuples(wells, plate):
-        cmd = (
-          f"008401{min_row + 1:02}{min_col + 1:02}{max_row + 1:02}{max_col + 1:02}0001200100001100100000135000100200200{excitation_wavelength_str}000"
-          f"{emission_wavelength_str}000000000000000000210011"
+        cmd = encode_fluorescence(
+          bounds=(min_row + 1, min_col + 1, max_row + 1, max_col + 1),
+          excitation_wavelength=excitation_wavelength,
+          emission_wavelength=emission_wavelength,
+          delay_microseconds=delay_microseconds,
+          collection_microseconds=collection_microseconds,
+          gain=gain,
+          dynamic_range=dynamic_range,
+          read_from=read_from,
+          excitation_bandwidth=excitation_bandwidth,
+          emission_bandwidth=emission_bandwidth,
+          flashes=flashes,
+          lamp_energy=lamp_energy,
         )
-        checksum = str((sum(cmd.encode()) + 7) % 100).zfill(2)
-        cmd = cmd + checksum + "\x03"
-        await self.send_command("D", cmd)
+        parse_assay_response(await self.send_command("D", cmd))
 
         resp = await self.send_command("O")
-        assert resp == b"\x060000\x03"
+        parse_response(resp, "O")
+        if resp != b"\x060000\x03":
+          raise ValueError(f"BioTek O: expected ACK and status, received {resp!r}")
 
-        body = await self._read_until(b"\x03", timeout=60 * 2)
+        # Allow long multiwell reads at high flash counts to finish. The margin
+        # covers carrier movement and slower high-energy lamp recharge.
+        well_count = (max_row - min_row + 1) * (max_col - min_col + 1)
+        timeout = max(120.0, 60 + well_count * (1 + flashes / 10))
+        body = await self._read_until(b"\x03", timeout=timeout)
         assert body is not None
         parsed_data = self._parse_body(body)
         for r in range(plate.num_items_y):
@@ -512,54 +600,107 @@ class BioTekPlateReaderDriver(_BioTekReader, metaclass=ABCMeta):
         )
       ]
 
+  async def read_fluorescence(
+    self,
+    plate: Plate,
+    wells: List[Well],
+    excitation_wavelength: int,
+    emission_wavelength: int,
+    focal_height: float,
+    *,
+    gain: int = 100,
+    dynamic_range: Literal["standard", "extended"] = "extended",
+    read_from: Literal["top", "bottom"] = "top",
+    excitation_bandwidth: int = 20,
+    emission_bandwidth: int = 20,
+    flashes: int = 10,
+    lamp_energy: Literal["low", "high"] = "high",
+  ) -> List[FluorescenceResult]:
+    """Read endpoint fluorescence through the monochromator optical path.
+
+    Args:
+      plate: Plate to read.
+      wells: Wells to read.
+      excitation_wavelength: Excitation wavelength in nm.
+      emission_wavelength: Emission wavelength in nm.
+      focal_height: Top-probe height in mm; ignored for bottom reads.
+      gain: PMT sensitivity, 0 or an integer from 25 to 255. Compare results only
+        with the same gain and range settings.
+      dynamic_range: Standard or extended result range.
+      read_from: Top or bottom monochromator optics.
+      excitation_bandwidth: Excitation bandwidth in nm; 9–50 on this Cytation 5.
+      emission_bandwidth: Emission bandwidth in nm; 9–50 on this Cytation 5.
+      flashes: Excitation flashes per well, from 1 to 255.
+      lamp_energy: Low or high excitation flash energy.
+    """
+    return await self._read_fluorescence(
+      plate,
+      wells,
+      excitation_wavelength,
+      emission_wavelength,
+      focal_height,
+      gain=gain,
+      dynamic_range=dynamic_range,
+      read_from=read_from,
+      excitation_bandwidth=excitation_bandwidth,
+      emission_bandwidth=emission_bandwidth,
+      flashes=flashes,
+      lamp_energy=lamp_energy,
+    )
+
   async def _abort(self) -> None:
+    """Abort an active cycle and consume its DLE/status completion frame."""
     await self.send_command("x", wait_for_response=False)
+    response = await self._read_until(b"\x03", timeout=30)
+    if len(response) != 6 or response[:1] != b"\x10":
+      raise ValueError(f"BioTek abort: expected DLE and status, received {response!r}")
+    self._check_status(response[-5:])
 
   class ShakeType(enum.IntEnum):
     LINEAR = 0
     ORBITAL = 1
 
+  async def _start_shaking_cycle(self, shake_type: ShakeType, frequency: int) -> None:
+    """Start one firmware-limited sixteen-minute shaking cycle."""
+    async with self._operation():
+      await self._prepare_plate_read()
+      cmd = f"0033010101010100002000000013960{shake_type.value}{frequency}01"
+      checksum = (sum(cmd.encode()) + 73) % 100
+      parse_response(await self.send_command("D", f"{cmd}{checksum:02d}\x03"), "D")
+      response = await self.send_command("O")
+      parse_response(response, "O")
+      if response != b"\x060000\x03":
+        raise ValueError(f"BioTek O: expected ACK and status, received {response!r}")
+
   async def shake(self, shake_type: ShakeType, frequency: int) -> None:
-    """Start continuous shaking.
+    """Start continuous shaking, reporting startup errors to the caller.
 
     Args:
-      frequency: speed, in mm. 360 CPM = 6mm; 410 CPM = 5mm; 493 CPM = 4mm;
-        567 CPM = 3mm; 731 CPM = 2mm; 1096 CPM = 1mm
+      shake_type: Linear or orbital shaking.
+      frequency: Speed setting: 6 = 360 CPM, 5 = 410 CPM, 4 = 493 CPM,
+        3 = 567 CPM, 2 = 731 CPM, 1 = 1096 CPM.
     """
+    if not isinstance(shake_type, self.ShakeType):
+      raise ValueError("shake_type must be a ShakeType")
+    if isinstance(frequency, bool) or not isinstance(frequency, int) or not 1 <= frequency <= 6:
+      raise ValueError("Frequency must be an integer between 1 and 6")
 
-    max_duration = 16 * 60
-    self._shaking_started = asyncio.Event()
+    async def renew_shaking() -> None:
+      """Renew the firmware cycle until stopped, logging later connection failures."""
+      try:
+        while self._shaking:
+          await asyncio.sleep(16 * 60)
+          if self._shaking:
+            await self._start_shaking_cycle(shake_type, frequency)
+      except Exception:
+        self._shaking = False
+        logger.exception("Continuous shaking stopped after a reader error")
 
-    async def shake_maximal_duration():
-      async with self._operation():
-        shake_type_bit = str(shake_type.value)
-        duration = str(max_duration).zfill(3)
-        assert 1 <= frequency <= 6, "Frequency must be between 1 and 6"
-        cmd = f"0033010101010100002000000013{duration}{shake_type_bit}{frequency}01"
-        checksum = str((sum(cmd.encode()) + 73) % 100).zfill(2)
-        cmd = cmd + checksum + "\x03"
-        await self.send_command("D", cmd)
-
-        resp = await self.send_command("O")
-        assert resp == b"\x060000\x03"
-
-        if not self._shaking_started.is_set():
-          self._shaking_started.set()
-
-    async def shake_continuous():
-      while self._shaking:
-        await shake_maximal_duration()
-
-        seconds_since_start: float = 0
-        loop_wait_time = 0.25
-        while seconds_since_start < max_duration and self._shaking:
-          seconds_since_start += loop_wait_time
-          await asyncio.sleep(loop_wait_time)
-
-    self._shaking = True
-    self._shaking_task = asyncio.create_task(shake_continuous())
-
-    await self._shaking_started.wait()
+    async with self._operation():
+      await self.stop_shaking()
+      await self._start_shaking_cycle(shake_type, frequency)
+      self._shaking = True
+      self._shaking_task = asyncio.create_task(renew_shaking())
 
   async def stop_shaking(self) -> None:
     """Abort shaking and release the background task under the shared connection lock."""

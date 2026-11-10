@@ -24,10 +24,12 @@ class _CytationBase(BioTekPlateReaderDriver, metaclass=abc.ABCMeta):
     self,
     name: str,
     device_id: Optional[str] = None,
+    port: Optional[str] = None,
   ):
     super().__init__(
       device_id=device_id,
       human_readable_device_name=self._model_name,
+      port=port,
     )
 
     self.plate_holder = PlateHolder(

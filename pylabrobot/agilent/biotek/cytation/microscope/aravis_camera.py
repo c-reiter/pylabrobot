@@ -1,4 +1,4 @@
-"""Standalone BlackFly camera driver using Aravis (GenICam/USB3 Vision).
+"""Cytation camera driver using Aravis (GenICam/USB3 Vision).
 
 Standalone: no PLR dependencies except numpy. ``CytationMicroscope`` delegates camera
 operations here; Aravis (via PyGObject) talks to the camera over USB3 Vision/GenICam.
@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 try:
   import numpy as np
@@ -59,7 +60,7 @@ class CameraInfo:
 
 
 class AravisCamera:
-  """BlackFly camera driver using Aravis for GenICam access over USB3 Vision.
+  """Cytation camera access through the vendor-independent USB3 Vision protocol.
 
   This class wraps all Aravis/GenICam operations for single-frame image
   acquisition with software triggering.
@@ -83,7 +84,7 @@ class AravisCamera:
     camera = AravisCamera()
     await camera.setup("12345678")
     await camera.set_exposure(10.0)  # 10 ms
-    image = await camera.trigger()    # numpy array, Mono8
+    image = await camera.trigger()    # numpy array, camera's monochrome format
     await camera.stop()
   """
 
@@ -96,6 +97,8 @@ class AravisCamera:
     self._width: int = 0
     self._height: int = 0
     self._payload_size: int = 0
+    self._pixel_byte_order: Literal["<", ">"] = "<"
+    self._capture_lock = asyncio.Lock()
 
   @property
   def width(self) -> int:
@@ -149,7 +152,7 @@ class AravisCamera:
         "  macOS:   brew install aravis && pip install PyGObject\n"
         "  Linux:   sudo apt-get install libaravis-dev gobject-introspection "
         "&& pip install PyGObject\n"
-        "  Windows: pacman -S mingw-w64-x86_64-aravis (in MSYS2)"
+        "  Windows: pacman -S mingw-w64-ucrt-x86_64-aravis (in MSYS2 UCRT64)"
       )
 
     self._serial_number = serial_number
@@ -187,13 +190,22 @@ class AravisCamera:
       ) from e
 
     self._device = self.camera.get_device()
+    if self.device.is_feature_available("PixelBigEndian"):
+      self._pixel_byte_order = (
+        ">" if self.device.get_boolean_feature_value("PixelBigEndian") else "<"
+      )
+    else:
+      # The GS3-U3-14S5M's older XML omits PixelBigEndian while its Mono16
+      # stream is big endian. Other USB3 Vision cameras use little endian.
+      model = self.device.get_string_feature_value("DeviceModelName")
+      self._pixel_byte_order = (
+        ">" if model in ("GS3-U3-14S5M", "Grasshopper3 GS3-U3-14S5M") else "<"
+      )
 
-    # Configure software trigger mode.
-    # GenICam nodes: TriggerSelector, TriggerSource, TriggerMode are
-    # standard SFNC (Standard Features Naming Convention) names.
-    self.device.set_string_feature_value("TriggerSelector", "FrameStart")
-    self.device.set_string_feature_value("TriggerSource", "Software")
-    self.device.set_string_feature_value("TriggerMode", "On")
+    # Aravis disables other trigger selectors and configures the appropriate edge
+    # and frame-rate settings for the camera model.
+    self.camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+    self.camera.set_trigger("Software")
 
     # Read image dimensions and payload size from camera.
     self._width = self.camera.get_region()[2]  # x, y, width, height
@@ -253,35 +265,57 @@ class AravisCamera:
             Default 5000 (5 seconds).
 
     Returns:
-        numpy.ndarray: Image as 2D uint8 array (height × width), Mono8 format.
+        numpy.ndarray: Image as a 2D array (height × width). Mono8 returns uint8;
+            unpacked Mono10, Mono12, and Mono16 return uint16.
 
     Raises:
-        RuntimeError: If camera not initialized, not acquiring, or times out.
+        RuntimeError: If the camera is not acquiring or a frame is incomplete.
+        TimeoutError: If no frame arrives before the deadline.
     """
     _ = self.camera
     if not self._acquiring:
       raise RuntimeError("Camera is not acquiring. Call start_acquisition() first.")
 
-    # Send software trigger command.
-    self.device.execute_command("TriggerSoftware")
-
-    # Pop the filled buffer from the stream.
-    # timeout_pop_buffer takes microseconds, so convert from ms.
-    buffer = self.stream.timeout_pop_buffer(timeout_ms * 1000)
-    if buffer is None:
-      raise RuntimeError(
-        f"Camera capture timed out after {timeout_ms}ms. "
-        "Is the camera connected and trigger mode configured?"
-      )
-
-    # Extract image data and copy to numpy array.
-    data = buffer.get_data()
-    image = np.frombuffer(data, dtype=np.uint8).reshape(self._height, self._width).copy()
-
-    # Return buffer to pool for reuse.
-    self.stream.push_buffer(buffer)
-
-    return image
+    if timeout_ms <= 0:
+      raise ValueError("timeout_ms must be positive")
+    async with self._capture_lock:
+      stream = self.stream
+      self.camera.software_trigger()
+      pending = asyncio.create_task(asyncio.to_thread(stream.timeout_pop_buffer, timeout_ms * 1000))
+      try:
+        buffer = await asyncio.shield(pending)
+      except asyncio.CancelledError:
+        buffer = await pending
+        if buffer is not None:
+          stream.push_buffer(buffer)
+        raise
+      if buffer is None:
+        raise TimeoutError(f"Camera capture timed out after {timeout_ms}ms")
+      try:
+        if buffer.get_status() != Aravis.BufferStatus.SUCCESS:
+          raise RuntimeError(f"Camera returned an incomplete frame: {buffer.get_status()}")
+        pixel_format = buffer.get_image_pixel_format()
+        # PFNC unpacked monochrome formats. Mono10/12 occupy 16 bits per pixel.
+        formats = {
+          0x01080001: "u1",
+          0x01100003: "<u2",
+          0x01100005: "<u2",
+          0x01100007: "<u2",
+        }
+        if pixel_format not in formats:
+          raise NotImplementedError(f"Unsupported camera pixel format: 0x{pixel_format:08x}")
+        dtype = np.dtype(formats[pixel_format]).newbyteorder(self._pixel_byte_order)
+        width, height = buffer.get_image_width(), buffer.get_image_height()
+        padding_x, _ = buffer.get_image_padding()
+        stride = width * dtype.itemsize + padding_x
+        data = buffer.get_image_data()
+        if len(data) < height * stride:
+          raise RuntimeError("Camera image payload is shorter than its dimensions")
+        return np.ndarray(
+          (height, width), dtype=dtype, buffer=data, strides=(stride, dtype.itemsize)
+        ).astype(dtype.newbyteorder("="), copy=True)
+      finally:
+        stream.push_buffer(buffer)
 
   async def stop(self) -> None:
     """Release camera and free all Aravis resources.
@@ -308,6 +342,24 @@ class AravisCamera:
       self._height = 0
       self._payload_size = 0
 
+  def get_pixel_max(self) -> int:
+    """Return the maximum code value of the active unpacked monochrome format."""
+    maxima = {0x01080001: 255, 0x01100003: 1023, 0x01100005: 4095, 0x01100007: 65535}
+    pixel_format = self.camera.get_pixel_format()
+    if pixel_format not in maxima:
+      raise NotImplementedError(f"Unsupported camera pixel format: 0x{pixel_format:08x}")
+    return maxima[pixel_format]
+
+  def get_exposure_limits(self) -> tuple[float, float]:
+    """Return the camera's allowed exposure interval in milliseconds."""
+    low, high = self.camera.get_exposure_time_bounds()
+    return float(low) / 1000, float(high) / 1000
+
+  def get_gain_limits(self) -> tuple[float, float]:
+    """Return the camera's allowed analog gain interval in dB."""
+    low, high = self.camera.get_gain_bounds()
+    return float(low), float(high)
+
   async def set_exposure(self, exposure_ms: float) -> None:
     """Set exposure time in milliseconds.
 
@@ -317,6 +369,9 @@ class AravisCamera:
     Args:
         exposure_ms: Exposure time in milliseconds (e.g., 10.0 = 10 ms).
     """
+    low, high = self.get_exposure_limits()
+    if not math.isfinite(exposure_ms) or not low <= exposure_ms <= high:
+      raise ValueError(f"Exposure must be between {low} and {high} ms")
     camera = self.camera
     # Disable auto-exposure before setting manual value.
     self.device.set_string_feature_value("ExposureAuto", "Off")
@@ -338,6 +393,9 @@ class AravisCamera:
     Args:
         gain: Gain value (e.g., 1.0).
     """
+    low, high = self.get_gain_limits()
+    if not math.isfinite(gain) or not low <= gain <= high:
+      raise ValueError(f"Gain must be between {low} and {high} dB")
     camera = self.camera
     self.device.set_string_feature_value("GainAuto", "Off")
     camera.set_gain(gain)
@@ -384,12 +442,20 @@ class AravisCamera:
         fmt: Aravis pixel format constant. If None, uses Mono8.
     """
     camera = self.camera
+    if self._acquiring:
+      raise RuntimeError("Stop acquisition before changing the pixel format")
     if fmt is None:
       if HAS_ARAVIS:
         fmt = Aravis.PIXEL_FORMAT_MONO_8
       else:
         return
     camera.set_pixel_format(fmt)
+    self._width, self._height = camera.get_region()[2:]
+    self._payload_size = camera.get_payload()
+    self._stream = None
+    self._stream = camera.create_stream(None, None)
+    for _ in range(_BUFFER_COUNT):
+      self.stream.push_buffer(Aravis.Buffer.new_allocate(self._payload_size))
 
   def get_device_info(self) -> CameraInfo:
     """Read camera identification from GenICam nodes.
@@ -429,7 +495,7 @@ class AravisCamera:
         "  macOS:   brew install aravis && pip install PyGObject\n"
         "  Linux:   sudo apt-get install libaravis-dev gobject-introspection "
         "&& pip install PyGObject\n"
-        "  Windows: pacman -S mingw-w64-x86_64-aravis (in MSYS2)"
+        "  Windows: pacman -S mingw-w64-ucrt-x86_64-aravis (in MSYS2 UCRT64)"
       )
 
     Aravis.update_device_list()
