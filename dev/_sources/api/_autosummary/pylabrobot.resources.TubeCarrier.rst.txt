@@ -1,5 +1,6 @@
 ﻿:orphan:
 
+
 pylabrobot.resources.TubeCarrier
 ================================
 
@@ -15,6 +16,7 @@ pylabrobot.resources.TubeCarrier
       :toctree: .
    
       ~TubeCarrier.capacity
+      ~TubeCarrier.location
       ~TubeCarrier.name
    
    
@@ -41,6 +43,8 @@ pylabrobot.resources.TubeCarrier
       ~TubeCarrier.deregister_will_assign_resource_callback
       ~TubeCarrier.deregister_will_unassign_resource_callback
       ~TubeCarrier.deserialize
+      ~TubeCarrier.find_resource
+      ~TubeCarrier.find_resources
       ~TubeCarrier.get_absolute_location
       ~TubeCarrier.get_absolute_rotation
       ~TubeCarrier.get_absolute_size_x
@@ -57,6 +61,7 @@ pylabrobot.resources.TubeCarrier
       ~TubeCarrier.get_size_x
       ~TubeCarrier.get_size_y
       ~TubeCarrier.get_size_z
+      ~TubeCarrier.has_resource
       ~TubeCarrier.is_in_subtree_of
       ~TubeCarrier.load_all_state
       ~TubeCarrier.load_from_json_file
@@ -69,6 +74,7 @@ pylabrobot.resources.TubeCarrier
       ~TubeCarrier.register_will_assign_resource_callback
       ~TubeCarrier.register_will_unassign_resource_callback
       ~TubeCarrier.rotate
+      ~TubeCarrier.rotate_to
       ~TubeCarrier.rotated
       ~TubeCarrier.save
       ~TubeCarrier.save_state_to_file

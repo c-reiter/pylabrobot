@@ -1,5 +1,6 @@
 ﻿:orphan:
 
+
 pylabrobot.resources.Rotation
 =============================
 
@@ -16,7 +17,10 @@ pylabrobot.resources.Rotation
    
       ~Rotation.pitch
       ~Rotation.roll
+      ~Rotation.x
+      ~Rotation.y
       ~Rotation.yaw
+      ~Rotation.z
    
    
 
@@ -28,7 +32,6 @@ pylabrobot.resources.Rotation
       :toctree: .
    
       ~Rotation.__init__
-      ~Rotation.deserialize
       ~Rotation.get_rotation_matrix
       ~Rotation.serialize
    

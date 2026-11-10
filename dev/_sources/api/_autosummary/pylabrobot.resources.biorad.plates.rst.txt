@@ -19,6 +19,8 @@ pylabrobot.resources.biorad.plates
       :toctree:
    
       BioRad_384_wellplate_50uL_Vb
+      biorad_384_wellplate_50uL_Vb
+      biorad_96_wellplate_200uL_Vb
    
    
 
